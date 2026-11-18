@@ -195,8 +195,12 @@ def read_timings():
     with open(TIMINGS, newline="") as f:
         for row in csv.DictReader(f):
             try:
-                model = models.setdefault(row["model"], {"steps": int(row["steps"]), "elements": int(row["elements"]), "runs": {}})
+                model = models.setdefault(row["model"], {"steps": int(row["steps"]), "elements": int(row["elements"]), "runs": {}, "preparation": {}, "wait": set()})
                 model["runs"].setdefault(int(row["threads"]), {}).setdefault(row["algorithm"], []).append(float(row["computation_ms"]))
+                if (row.get("preparation_ms") or "").isdigit():
+                    model["preparation"].setdefault(row["algorithm"], []).append(float(row["preparation_ms"]))
+                if row.get("wait"):
+                    model["wait"].add(row["wait"])
             except (KeyError, ValueError):
                 continue   # a line that is not a timing
     return models
@@ -232,8 +236,9 @@ def speed_of(selected, one):
             first = solvers.get(order[0])   # speed-up: the baseline solver's fastest run divided by this solver's fastest run
             speedups = {name: first["best"] / t["best"] for name, t in solvers.items() if first and name != order[0] and t["best"] > 0}
             rows.append({"threads": threads, "solvers": solvers, "speedups": speedups})
+        preparation = {name: min(times) for name, times in recorded[model]["preparation"].items() if name in order}
         timings.append({"model": model, "steps": recorded[model]["steps"], "elements": recorded[model]["elements"],
-                        "algorithms": order, "rows": rows})
+                        "algorithms": order, "rows": rows, "preparation": preparation, "wait": sorted(recorded[model]["wait"])})
     return timings, missing
 
 
@@ -261,6 +266,9 @@ def print_speed(timings, missing):
         names = model["algorithms"]
         column = max(24, max(len(name) for name in names) + 20)
         print(f"  {model['model']}: {model['elements']:,} elements, {model['steps']:,} steps")
+        if model["preparation"]:
+            print("    preparation (reading and set-up, not part of the computation time): "
+                  + ", ".join(f"{name} {ms_text(model['preparation'][name])}" for name in names if name in model["preparation"]))
         print("    threads" + "".join(f"{name:>{column}}" for name in names))
         for row in model["rows"]:
             line = f"    {row['threads']:>7}"
@@ -354,7 +362,9 @@ def build_report(pairs, baseline, timings, missing, tolerance):
 <div class="chart timing" data-model="{m}" role="img" aria-label="Fastest computation time per solver and thread count; the values are in the table below"></div>
 <div class="scroll"><table><thead><tr><th class="num" rowspan="2">Threads</th>{head1}<th class="num" rowspan="2">Fastest solver, time per step</th></tr>
 <tr>{head2}</tr></thead>
-<tbody>{"".join(rows)}</tbody></table></div>''')
+<tbody>{"".join(rows)}</tbody></table></div>
+<p class="muted">Every solver ran with the same thread count in each row{", and with the " + e(model["wait"][0]) + " wait policy" if len(model["wait"]) == 1 else ""}.
+{("Preparation (reading the model and set-up, not part of the computation time), fastest run: " + "; ".join(f"{e(name)} {ms_text(model['preparation'][name])}" for name in names if name in model["preparation"]) + ".") if model["preparation"] else ""}</p>''')
         parts.append(f'''<section class="card"><h2>Speed</h2>
 <p class="lead">Computation time of the time loop only (no file reading, no VTK export), from <code>results/timings.csv</code>.
 Speed-up is the baseline solver's fastest run divided by the other solver's fastest run at the same thread count.</p>

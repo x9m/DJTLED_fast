@@ -500,6 +500,10 @@ static bool runSimulation(const Model& m, Solver& s, VtkExporter& exporter)
     auto nfacOf = [&](size_t stp) { return min(1.f, (stp + 1) * m.dt / m.total_t); };   // BC:Disp ramp, never above the full displacement
     cout << "\n\tusing " << nthreads << " threads" << endl;
     cout << "\tcomputing..." << endl;
+    // Computation time = the solution only: the time loop's wall time, minus the time spent writing animation frames
+    // (measured inside the exporter) and minus the time spent printing the progress lines (print_t, thread 0 only).
+    // Reading the model, the set-up (reordering, precomputation) and the final-state export are outside the loop.
+    chrono::high_resolution_clock::duration print_t(0);
     auto start_t = chrono::high_resolution_clock::now();
 
     float* Ubuf[3] = { s.U[0].data(), s.U[1].data(), s.U[2].data() };   // previous, current, next
@@ -523,11 +527,16 @@ static bool runSimulation(const Model& m, Solver& s, VtkExporter& exporter)
 #pragma omp single
                 exporter.writeFrame(stp, Uc);
             }
-            if (omp_get_thread_num() == 0 && (float)(stp + 1) / (float)m.num_steps * 100.f >= progress + 10) { progress += 10; cout << "\t\t\t(" << progress << "%)" << endl; }
+            if (omp_get_thread_num() == 0 && (float)(stp + 1) / (float)m.num_steps * 100.f >= progress + 10)
+            {
+                const auto print_start = chrono::high_resolution_clock::now();
+                progress += 10; cout << "\t\t\t(" << progress << "%)" << endl;
+                print_t += chrono::high_resolution_clock::now() - print_start;   // only thread 0 writes print_t
+            }
         }
         if (omp_get_thread_num() == 0) { s.U_curr = Uc; steps_done = stp + 1; }
     }
-    const auto elapsed = chrono::high_resolution_clock::now() - start_t - exporter.animationTime();   // solution only
+    const auto elapsed = chrono::high_resolution_clock::now() - start_t - exporter.animationTime() - print_t;   // solution only
     s.fallbacks = fallbacks;
     exporter.endAnimation(!stop);
     if (stop & STOP_INVERTED) { cerr << "\n\tError: an element inverted (its Jacobian determinant became zero or negative) at step " << steps_done << ", simulation aborted. Try a smaller time step." << endl; return false; }
@@ -595,12 +604,15 @@ int main(int argc, char **argv)
     if (fname == nullptr) { cerr << "\n\tError: missing input argument (e.g., NH.txt). " << usage << endl; return EXIT_FAILURE; }
     if (threads > 0) { omp_set_num_threads(threads); }   // --threads wins over the defaults above
     Model m;
+    const auto read_start = chrono::high_resolution_clock::now();
     if (!readModel(fname, m)) { return EXIT_FAILURE; }
+    auto preparation = chrono::high_resolution_clock::now() - read_start;   // reading the model and set-up; reported, not part of the computation time
     printInfo(m, reorder);
     Solver s;
-    auto t0 = chrono::high_resolution_clock::now();
+    const auto setup_start = chrono::high_resolution_clock::now();
     if (!setup(m, s, reorder)) { return EXIT_FAILURE; }
-    cout << "\n\tSetup time (reordering, precomputation):\t" << chrono::duration_cast<chrono::milliseconds>(chrono::high_resolution_clock::now() - t0).count() << " ms" << endl;
+    preparation += chrono::high_resolution_clock::now() - setup_start;
+    cout << "\n\tPreparation time:\t" << chrono::duration_cast<chrono::milliseconds>(preparation).count() << " ms (reading the model and set-up; not part of the computation time)" << endl;
     // VTK output (vtk_export.cpp): views of the mesh in the input numbering; newOfOld maps it to the solver numbering of U
     static_assert(sizeof(array<unsigned, 4>) == 4 * sizeof(unsigned), "element nodes must be stored as a flat array");
     VtkExporter exporter(SOLVER_NAME, m.fname, export_mode, VtkMesh{ m.nodes(), m.X.data(), m.tets.size(), m.tets[0].data(), s.newOfOld.data() });

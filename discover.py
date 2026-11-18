@@ -16,7 +16,6 @@ output files. That is how a result file can be traced back to its solver and mod
 import os
 import platform
 import re
-import subprocess
 from collections import namedtuple
 from pathlib import Path
 
@@ -84,14 +83,17 @@ def split_result_name(name):
 
 
 def default_threads():
-    """The thread count every solver gets in a like-for-like timing when none is asked for: the performance cores on
-    Apple silicon (the efficiency cores are much slower and would hold every step back), otherwise all cores."""
+    """The thread count every solver gets when none is asked for, so that their times can be compared: the performance
+    cores on Apple silicon (the efficiency cores are much slower and would hold every step back), otherwise all cores."""
     if platform.system() == "Darwin":
         try:
-            cores = int(subprocess.run(["sysctl", "-n", "hw.perflevel0.physicalcpu"], capture_output=True, text=True).stdout)
-            if cores > 0:
-                return cores
-        except (ValueError, OSError):
+            import ctypes
+            import ctypes.util
+            libc = ctypes.CDLL(ctypes.util.find_library("c"))
+            cores, size = ctypes.c_int(0), ctypes.c_size_t(ctypes.sizeof(ctypes.c_int))
+            if libc.sysctlbyname(b"hw.perflevel0.physicalcpu", ctypes.byref(cores), ctypes.byref(size), None, 0) == 0 and cores.value > 0:
+                return cores.value
+        except (OSError, AttributeError):
             pass
     return os.cpu_count() or 1
 

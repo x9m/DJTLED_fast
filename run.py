@@ -12,22 +12,31 @@ Models  are the .txt files in models/.
 Solvers are the .cpp files in src/ that have a main(); a solver's name is its file name without .cpp. For -a give that
         name, any part of it that fits only one solver (e.g. fast), or "all".
 Export: "both" (animation + final state), "animation", "final" or "none".
-Threads: a number, or each solver's own default.
 Benchmark (--benchmark): runs the solvers without any export, --repeats times (default 3) for every thread count in
--t (a list such as 1,4,10 is allowed here), and saves the computation times in results/timings.csv. Every solver gets
-the same thread count so the times can be compared; without -t that is the number of performance cores (all cores on
-other machines). compare.py shows the times, with the speed-up, in its report.
+-t (a list such as 1,4,10 is allowed here), and saves the times in results/timings.csv. compare.py shows them, with the
+speed-up, in its report.
+
+Every solver is run under the same conditions, so that their times can be compared:
+  threads      the same count for every solver: -t, or without it the number of performance cores (all cores on
+               other machines)
+  wait policy  the same OpenMP wait policy for every solver: --wait active (default; idle threads spin, best on an
+               idle machine) or --wait passive (idle threads sleep; use it when the machine is busy with other work)
+  times        each solver reports its computation time (the time loop only) and, separately, its preparation time
+               (reading the model and set-up); a benchmark records both, pauses between runs (--pause, default 2 s)
+               and warns when the machine is busy
 A solver is compiled here, into build/, when its executable is missing or older than its sources. The solvers write
 their VTK files to results/ in this folder, named <solver>_<model>_...
 """
 import argparse
 import csv
 import datetime
+import os
 import platform
 import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 sys.dont_write_bytecode = True   # no __pycache__ folder: its files would hold this computer's folder path
@@ -35,7 +44,7 @@ import discover
 from discover import ROOT, RESULTS
 
 TIMINGS = RESULTS / "timings.csv"   # written by --benchmark, read by compare.py
-TIMING_COLUMNS = ["model", "algorithm", "threads", "repeat", "computation_ms", "steps", "nodes", "elements", "date"]
+TIMING_COLUMNS = ["model", "algorithm", "threads", "repeat", "computation_ms", "preparation_ms", "wait", "steps", "nodes", "elements", "date"]
 EXPORTS = {  # value passed to the solver's --export option: (menu text, endings of the files it writes)
     "both": ("animation and final state", ["_animation.pvd", "_timesteps", "_deformed.vtk", "_undeformed.vtk"]),
     "animation": ("animation only", ["_animation.pvd", "_timesteps"]),
@@ -70,12 +79,13 @@ def parse_threads(text):
 
 
 def ask_threads(several):
-    """Ask for the thread count(s); an empty answer means each solver's own default (returned as [None])."""
+    """Ask for the thread count(s), the same for every solver; an empty answer means the default count."""
     what = "a number or a list such as 1,4,10" if several else "a number"
+    default = discover.default_threads()
     while True:
-        answer = input(f"\nHow many threads? ({what}, or just Enter for each solver's default): ").strip()
+        answer = input(f"\nHow many threads for every solver? ({what}, or just Enter for {default}): ").strip()
         if answer == "":
-            return [None]
+            return [default]
         threads = parse_threads(answer)
         if threads and (several or len(threads) == 1):
             return threads
@@ -136,12 +146,15 @@ def build(solvers):
             sys.exit(f"Compiling {solver.source.name} failed:\n{' '.join(command)}\n{result.stderr}")
 
 
-def run(solver, model, export, threads):
-    command = [str(solver.exe), str(model), "--export", export]
-    if threads:
-        command += ["--threads", str(threads)]
-    print(f"\n=== {solver.name} on {model.name} (export: {export}, threads: {threads or 'default'}) ===", flush=True)
-    code = subprocess.run(command, cwd=ROOT).returncode  # the solver creates results/ in the folder it runs from
+def solver_environment(wait):
+    """The environment every solver is started with: the same OpenMP wait policy for all of them."""
+    return dict(os.environ, OMP_WAIT_POLICY=wait)
+
+
+def run(solver, model, export, threads, wait):
+    command = [str(solver.exe), str(model), "--export", export, "--threads", str(threads)]
+    print(f"\n=== {solver.name} on {model.name} (export: {export}, threads: {threads}, wait policy: {wait}) ===", flush=True)
+    code = subprocess.run(command, cwd=ROOT, env=solver_environment(wait)).returncode  # the solver creates results/ where it runs
     prefix = f"{solver.name}_{model.stem}"
     if code == 0:
         written = [prefix + e for e in EXPORTS[export][1] if (RESULTS / (prefix + e)).exists()]
@@ -153,25 +166,31 @@ def run(solver, model, export, threads):
     return code
 
 
-def benchmark(solvers, model, thread_list, repeats):
-    """Time the chosen solvers without any export and save the computation times in results/timings.csv."""
+def benchmark(solvers, model, thread_list, repeats, wait="active", pause=2.0):
+    """Time the chosen solvers without any export, all under the same conditions, and save the times in results/timings.csv."""
     grab = lambda pattern, text: (re.search(pattern, text) or [None, None])[1]
     width = max(len(s.name) for s in solvers)
     rows, failed = [], False
-    print(f"\nBenchmark on {model.name}: {repeats} run(s) per solver and thread count, no VTK export.")
+    print(f"\nBenchmark on {model.name}: {repeats} run(s) per solver and thread count, no VTK export, wait policy {wait}.")
+    load = os.getloadavg()[0] if hasattr(os, "getloadavg") else 0.0
+    if load > 2.0:
+        print(f"  WARNING: the machine is busy (load {load:.1f}); these timings will be slower and less repeatable than on an idle machine"
+              + (" - consider --wait passive." if wait == "active" else "."))
     for threads in thread_list:
         for repeat in range(1, repeats + 1):
             for solver in solvers:   # the solvers take turns, so a machine that warms up slows all alike
-                command = [str(solver.exe), str(model), "--export", "none"] + (["--threads", str(threads)] if threads else [])
-                done = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
+                command = [str(solver.exe), str(model), "--export", "none", "--threads", str(threads)]
+                done = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, env=solver_environment(wait))
+                time.sleep(pause)   # let the machine settle before the next run
                 ms, used = grab(r"Computation time:\s*(\d+) ms", done.stdout), grab(r"using (\d+) threads", done.stdout)
                 if done.returncode != 0 or ms is None or used is None:
                     failed = True
                     message = (done.stderr.strip().splitlines() or ["no computation time in the output"])[-1].strip()
-                    print(f"  {solver.name:<{width}} {threads or 'default':>7} threads  run {repeat}/{repeats}:  FAILED ({message})")
+                    print(f"  {solver.name:<{width}} {threads:>7} threads  run {repeat}/{repeats}:  FAILED ({message})")
                     continue
                 print(f"  {solver.name:<{width}} {used:>7} threads  run {repeat}/{repeats}: {int(ms):>9,} ms", flush=True)
                 rows.append({"model": model.stem, "algorithm": solver.name, "threads": int(used), "repeat": repeat, "computation_ms": int(ms),
+                             "preparation_ms": grab(r"Preparation time:\s*(\d+) ms", done.stdout), "wait": wait,
                              "steps": grab(r"NumSteps:\s*(\d+)", done.stdout), "nodes": grab(r"Nodes:\s*(\d+)", done.stdout),
                              "elements": grab(r"Elements:\s*(\d+)", done.stdout),
                              "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M")})
@@ -210,10 +229,13 @@ def main():
     parser.add_argument("-a", "--algorithm", help="solver name (a .cpp file in src/ with a main()), a part of it that fits "
                                                   "only one solver, or 'all'")
     parser.add_argument("-e", "--export", choices=list(EXPORTS), help="VTK files to write (default with -m and -a: both)")
-    parser.add_argument("-t", "--threads", help="threads for every solver run (default: each solver's own default); "
+    parser.add_argument("-t", "--threads", help="threads for every solver run (default: the performance cores, the same for every solver); "
                                                 "with --benchmark a list such as 1,4,10")
     parser.add_argument("-b", "--benchmark", action="store_true", help="time the solvers (no export) and save results/timings.csv")
     parser.add_argument("--repeats", type=int, default=3, help="--benchmark: runs per solver and thread count (default 3)")
+    parser.add_argument("--pause", type=float, default=2.0, help="--benchmark: seconds to wait between runs (default 2)")
+    parser.add_argument("--wait", choices=["active", "passive"], default="active",
+                        help="OpenMP wait policy given to every solver: active (default) or passive (for a busy machine)")
     args = parser.parse_args()
     thread_list = None
     if args.threads is not None:
@@ -224,6 +246,8 @@ def main():
             parser.error("--threads takes one number (a list is only for --benchmark)")
     if args.repeats < 1:
         parser.error("--repeats must be 1 or more")
+    if args.pause < 0:
+        parser.error("--pause must be 0 or more")
 
     all_solvers = discover.find_solvers()
     if not all_solvers:
@@ -247,10 +271,9 @@ def main():
 
     if args.benchmark:
         if thread_list is None:
-            thread_list = [None] if args.model else ask_threads(several=True)
-        thread_list = [threads or discover.default_threads() for threads in thread_list]   # the same count for every solver
+            thread_list = [discover.default_threads()] if args.model else ask_threads(several=True)
         build(solvers)
-        sys.exit(benchmark(solvers, model, thread_list, args.repeats))
+        sys.exit(benchmark(solvers, model, thread_list, args.repeats, args.wait, args.pause))
 
     if args.export:
         export = args.export
@@ -260,11 +283,11 @@ def main():
         export = list(EXPORTS)[ask("What to export?", [text for text, _ in EXPORTS.values()])]
 
     if thread_list is None:
-        thread_list = [None] if (args.model and args.algorithm) else ask_threads(several=False)
-    threads = thread_list[0]
+        thread_list = [discover.default_threads()] if (args.model and args.algorithm) else ask_threads(several=False)
+    threads = thread_list[0]   # the same count for every solver
 
     build(solvers)
-    codes = [run(solver, model, export, threads) for solver in solvers]
+    codes = [run(solver, model, export, threads, args.wait) for solver in solvers]
     sys.exit(1 if any(codes) else 0)  # a solver killed by a signal has a negative code
 
 

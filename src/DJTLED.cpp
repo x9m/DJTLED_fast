@@ -22,7 +22,7 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
-// DJTLED.cpp: the original DJ-TLED code by Jinao Zhang, modified by Baiqi Cheng (builds on macOS and Linux as well as; 
+// DJTLED.cpp: the original DJ-TLED code by Jinao Zhang, modified by Baiqi Cheng (builds on macOS); 
 // VTK export moved to vtk_export.cpp; the timer covers the solution only).
 #define _CRT_SECURE_NO_WARNINGS // MSVC: allow the standard fopen/fscanf, which also build on macOS and Linux
 #include <algorithm>
@@ -40,7 +40,8 @@ using namespace  std;
 #ifndef SOLVER_NAME // the name in front of the output files; run.py sets it to this file's name when it compiles
 #define SOLVER_NAME "DJTLED"
 #endif
-static int NUM_THREADS(omp_get_max_threads()); // OpenMP threads: all cores unless --threads (or OMP_NUM_THREADS) says otherwise
+static int NUM_THREADS(omp_get_max_threads());
+static chrono::high_resolution_clock::duration g_preparation(0); // reading the model and set-up; reported, not part of the computation time // OpenMP threads: all cores unless --threads (or OMP_NUM_THREADS) says otherwise
 
 // matrix computation/operations (mat: matrix, 33: 3 rows by 3 columns, x: multiplication, T: transpose, Det: determinant, Inv: inverse)
 void mat33x33    (const float A[3][3], const float B[3][3], float AB[3][3]);
@@ -242,7 +243,9 @@ int main(int argc, char **argv)
         else if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc && atoi(argv[i + 1]) > 0) { NUM_THREADS = atoi(argv[++i]); omp_set_num_threads(NUM_THREADS); }
         else { cerr << "\n\tError: unknown option or value: " << argv[i] << ". Usage: djtled <input.txt> [--export both|animation|final|none] [--threads N]" << endl; return EXIT_FAILURE; }
     }
-    Model* model = readModel(argc, argv);
+    auto read_start = chrono::high_resolution_clock::now();
+    Model* model = readModel(argc, argv); // reads the file and precomputes the element data
+    g_preparation += chrono::high_resolution_clock::now() - read_start;
     if (model != nullptr)
     {
         printInfo(*model);
@@ -361,24 +364,35 @@ void printInfo(const Model& model)
 
 ModelStates* runSimulation(const Model& model, VtkExporter& exporter)
 {
+    auto setup_start = chrono::high_resolution_clock::now();
     ModelStates* modelstates = new ModelStates(model);
     initBC(model, *modelstates);
+    g_preparation += chrono::high_resolution_clock::now() - setup_start;
+    cout << "\n\tPreparation time:\t" << chrono::duration_cast<chrono::milliseconds>(g_preparation).count() << " ms (reading the model and set-up; not part of the computation time)" << endl;
     size_t progress(0);
     cout << "\n\tusing " << NUM_THREADS << " threads" << endl;
     cout << "\tcomputing..." << endl;
     
     exporter.beginAnimation(model.m_num_steps, model.m_dt); // does nothing unless the animation is switched on
     
+    // Computation time = the solution only: the time loop's wall time, minus the time spent writing animation frames
+    // (measured inside the exporter) and minus the time spent printing the progress lines (print_t).
+    chrono::high_resolution_clock::duration print_t(0);
     auto start_t = chrono::high_resolution_clock::now();
     for (size_t step = 0; step < model.m_num_steps; step++) // simulation loop
     {
-        if ((float)(step + 1) / (float)model.m_num_steps * 100.f >= progress + 10) { progress += 10; cout << "\t\t\t(" << progress << "%)" << endl; }
+        if ((float)(step + 1) / (float)model.m_num_steps * 100.f >= progress + 10)
+        {
+            auto print_start = chrono::high_resolution_clock::now();
+            progress += 10; cout << "\t\t\t(" << progress << "%)" << endl;
+            print_t += chrono::high_resolution_clock::now() - print_start;
+        }
         computeRunTimeBC(model, *modelstates, step);
         bool no_err = computeOneStep(model, *modelstates);
         if (!no_err) { exporter.endAnimation(false); delete modelstates; return nullptr; }
         if (exporter.isFrameStep(step)) { exporter.writeFrame(step, modelstates->m_curr_U.data()); } // one animation frame
     }
-    auto elapsed = chrono::high_resolution_clock::now() - start_t - exporter.animationTime(); // solution only
+    auto elapsed = chrono::high_resolution_clock::now() - start_t - exporter.animationTime() - print_t; // solution only
     exporter.endAnimation(true);
     
     long long t = chrono::duration_cast<chrono::milliseconds>(elapsed).count();
