@@ -16,8 +16,9 @@ and its reference file. Whichever of the three you choose, every selected item i
           A comparison PASSES when the largest difference magnitude is at most --tol percent (default 0.5) of the
           largest displacement in the baseline; the exit code is 1 if any comparison fails.
   speed   The computation times of the solvers behind the selected results, from results/timings.csv, with the
-          speed-up against the baseline's solver. A solver that has not been timed on that model yet is timed now
-          (one run, no export, the same thread count as the others; the menus ask first, --no-timing skips it).
+          speed-up against the baseline's solver. A solver that has not been timed on that model yet, or whose
+          timings are out of date, is timed after you confirm (one run, no export, the same thread count and wait
+          policy as the others; --no-timing skips it, and a non-interactive --one/--with run never re-times).
           python3 run.py --benchmark measures more carefully (3 runs, several thread counts). A reference file has no
           solver, so it has no speed.
 
@@ -44,9 +45,10 @@ from pathlib import Path
 
 sys.dont_write_bytecode = True   # no __pycache__ folder: its files would hold this computer's folder path
 import discover
+import run   # run.py: builds the solvers, holds the benchmark and the helpers shared with it
 from discover import RESULTS, REFERENCES
+from run import TIMINGS, ask, speed_text
 
-TIMINGS = RESULTS / "timings.csv"
 REPORT = RESULTS / "compare_report.html"
 MAP_POINTS = 20000                        # at most this many points are drawn in the report's error maps
 
@@ -70,15 +72,24 @@ def read_vtk(path):
     try:
         i_points = next(i for i, l in enumerate(lines) if l.startswith("POINTS"))
         i_data = next(i for i, l in enumerate(lines) if l.startswith("POINT_DATA"))
-        i_vectors = next(i for i in range(i_data, len(lines)) if lines[i].startswith("VECTORS"))
     except StopIteration:
-        sys.exit(f"{path}: not a VTK file with POINTS and POINT_DATA / VECTORS")
+        sys.exit(f"{path}: not a VTK file with POINTS and POINT_DATA")
+    vector_lines = [i for i in range(i_data, len(lines)) if lines[i].startswith("VECTORS")]
+    if not vector_lines:
+        sys.exit(f"{path}: no VECTORS field after POINT_DATA")
+    i_vectors = vector_lines[0]
+    for i in vector_lines:   # prefer the field named "displacement"; references use a single legacy-named field
+        parts = lines[i].split()
+        if len(parts) >= 2 and parts[1] == "displacement":
+            i_vectors = i
+            break
     n = int(lines[i_points].split()[1])
     xyz, _ = take_values(lines, i_points + 1, 3 * n, path)
     u, _ = take_values(lines, i_vectors + 1, 3 * n, path)
     return {"points": [tuple(xyz[3 * i:3 * i + 3]) for i in range(n)],
             "displacements": [tuple(u[3 * i:3 * i + 3]) for i in range(n)],
-            "mesh_lines": lines[:i_data]}   # header, points, cells, cell types
+            "mesh_lines": lines[:i_data],   # header, points, cells, cell types
+            "deformed": not str(path).endswith("_undeformed.vtk")}   # the _undeformed file stores x, not x + u
 
 
 def short(path):
@@ -103,6 +114,27 @@ def compare(result, baseline, kind, tolerance, write_csv=True, write_vtk=True):
            "passed": False, "error": None}
     if len(res["displacements"]) != n:
         out["error"] = f"the result has {len(res['displacements'])} points, the baseline has {n}"
+        print(f"  Cannot compare: {out['error']}.")
+        return out
+    for name, data in (("result", res), ("baseline", ref)):   # a NaN would otherwise count as no difference, and pass
+        if not all(math.isfinite(v) for u in data["displacements"] for v in u):
+            out["error"] = f"the {name} has displacements that are not finite numbers (NaN or infinite)"
+            print(f"  Cannot compare: {out['error']}.")
+            return out
+
+    # Equal point counts are not enough: the two files must describe the same undeformed mesh in the same order.
+    # A translated mesh or renumbered ids would otherwise be compared point-by-point and give a wrong answer.
+    # The _undeformed files store the undeformed coordinates directly; every other file stores x + u.
+    def undeformed(data):
+        return [tuple(data["points"][i][k] - (data["displacements"][i][k] if data["deformed"] else 0.0) for k in range(3)) for i in range(n)]
+    ref_undef = undeformed(ref)
+    res_undef = undeformed(res)
+    scale = max(abs(c) for p in ref_undef for c in p) or 1.0
+    # The tolerance is generous on purpose: the reference files store coordinates to about six significant digits,
+    # so "points minus displacement" recovers the undeformed mesh only to ~1e-6 of the coordinate scale. A genuinely
+    # different mesh (translated or renumbered) differs by far more than that.
+    if any(abs(res_undef[i][k] - ref_undef[i][k]) > 1e-3 * scale for i in range(n) for k in range(3)):
+        out["error"] = "the result and the baseline describe different meshes (their undeformed coordinates do not match)"
         print(f"  Cannot compare: {out['error']}.")
         return out
 
@@ -173,6 +205,7 @@ def compare(result, baseline, kind, tolerance, write_csv=True, write_vtk=True):
         error_map = RESULTS / f"{stem}.vtk"
         with open(error_map, "w") as f:
             mesh = list(res["mesh_lines"])
+            mesh[0] = "# vtk DataFile Version 3.0"   # a reference file may carry a version number that does not exist
             mesh[1] = f"difference {short(result)} - {short(baseline)}"[:255]
             f.write("\n".join(mesh) + "\n")
             f.write(f"POINT_DATA {n}\nVECTORS difference float\n")
@@ -188,28 +221,37 @@ def compare(result, baseline, kind, tolerance, write_csv=True, write_vtk=True):
 
 # ------------------------------------------------------------------------------------------------- timings
 def read_timings():
-    """results/timings.csv (written by run.py --benchmark): {model: {"steps", "elements", "runs": {threads: {solver: [ms, ...]}}}}."""
+    """results/timings.csv as {model: {steps: {threads: {solver: group}}}}. A group is the rows of one solver at one
+    thread count for one workload (number of steps): {"runs": [ms, ...], "preparation": [ms, ...], "elements", "wait",
+    "fingerprint"}. The wait policy and the fingerprint are those of the group's first row (run.py --benchmark
+    replaces a group as a whole). speed_of uses them to leave out groups measured before an edit, and to refuse to
+    ratio runs that were not made under the same conditions."""
     models = {}
     if not TIMINGS.is_file():
         return models
     with open(TIMINGS, newline="") as f:
         for row in csv.DictReader(f):
             try:
-                model = models.setdefault(row["model"], {"steps": int(row["steps"]), "elements": int(row["elements"]), "runs": {}, "preparation": {}, "wait": set()})
-                model["runs"].setdefault(int(row["threads"]), {}).setdefault(row["algorithm"], []).append(float(row["computation_ms"]))
-                if (row.get("preparation_ms") or "").isdigit():
-                    model["preparation"].setdefault(row["algorithm"], []).append(float(row["preparation_ms"]))
-                if row.get("wait"):
-                    model["wait"].add(row["wait"])
-            except (KeyError, ValueError):
+                model, solver, threads, ms = row["model"], row["algorithm"], int(row["threads"]), float(row["computation_ms"])
+                steps = int(row["steps"])
+                first = {"runs": [], "preparation": [], "elements": int(row["elements"]),
+                         "wait": row.get("wait") or "", "fingerprint": row.get("fingerprint") or ""}
+            except (KeyError, ValueError, TypeError):
                 continue   # a line that is not a timing
+            if not model or not solver:
+                continue
+            group = models.setdefault(model, {}).setdefault(steps, {}).setdefault(threads, {}).setdefault(solver, first)
+            group["runs"].append(ms)
+            if (row.get("preparation_ms") or "").isdigit():
+                group["preparation"].append(float(row["preparation_ms"]))
     return models
 
 
 def speed_of(selected, one):
-    """The speed comparison for the selected files: for each model, the timings of the solvers behind the selected
-    results, with the baseline's solver first (if the baseline is a reference: the solver with the shortest name).
-    Returns (list of models with their timings, list of (solver, model) that have not been timed)."""
+    """The speed comparison for the selected files: for each model and each workload timed on it (a full run, or a
+    partial run of N steps), the timings of the solvers behind the selected results, with the baseline's solver first
+    (if the baseline is a reference: the solver with the shortest name).
+    Returns (list of model workloads with their timings, list of (solver, model) that have not been timed)."""
     wanted = {}   # model -> solver names
     for path in selected:
         solver, model = split_result_name(path)
@@ -217,35 +259,73 @@ def speed_of(selected, one):
             wanted[model].append(solver)
     base = split_result_name(one)[0]
     recorded = read_timings()
+    # current identity of each solver+model pair, so timings taken before an edit are discarded (and re-timed)
+    solver_defs = {s.name: s for s in discover.find_solvers()}
+    models = {m.stem: m for m in discover.find_models()}
+    shared = discover.shared_sources()
+    headers = discover.headers()
+    def current_fingerprint(mname, sname):
+        if mname not in models or sname not in solver_defs:
+            return None
+        return discover.file_fingerprint(models[mname], solver_defs[sname].source, *shared, *headers)
     timings, missing = [], []
     for model, names in wanted.items():
-        runs = recorded.get(model, {}).get("runs", {})
-        timed = [name for name in names if any(name in by_solver for by_solver in runs.values())]
-        missing += [(name, model) for name in names if name not in timed]
-        if not timed:
-            continue
-        order = discover.baseline_first(timed)
-        if base in order:
-            order = [base] + [name for name in order if name != base]
-        rows = []
-        for threads in sorted(runs):
-            solvers = {name: {"runs": runs[threads][name], "best": min(runs[threads][name]), "median": statistics.median(runs[threads][name])}
-                       for name in order if name in runs[threads]}
-            if not solvers:
+        current = {name: current_fingerprint(model, name) for name in names}
+        blocks, timed, stale = [], set(), []
+        # One block per workload, the fullest run first: a partial run (--steps) and a full run are never mixed.
+        for steps, by_threads in sorted(recorded.get(model, {}).items(), reverse=True):
+            # Each (thread count, solver) group is judged on its own: it counts only if it was measured with the
+            # present model and sources. A benchmark of one thread count must not hide, or be hidden by, older rows
+            # of another.
+            fresh = {}
+            for threads, by_solver in sorted(by_threads.items()):
+                for name in names:
+                    if name not in by_solver:
+                        continue
+                    if by_solver[name]["fingerprint"] and by_solver[name]["fingerprint"] == current[name]:
+                        fresh.setdefault(threads, {})[name] = by_solver[name]
+                    else:
+                        stale.append((name, threads, steps))
+            present = [name for name in names if any(name in by_solver for by_solver in fresh.values())]
+            if not present:
                 continue
-            first = solvers.get(order[0])   # speed-up: the baseline solver's fastest run divided by this solver's fastest run
-            speedups = {name: first["best"] / t["best"] for name, t in solvers.items() if first and name != order[0] and t["best"] > 0}
-            rows.append({"threads": threads, "solvers": solvers, "speedups": speedups})
-        preparation = {name: min(times) for name, times in recorded[model]["preparation"].items() if name in order}
-        timings.append({"model": model, "steps": recorded[model]["steps"], "elements": recorded[model]["elements"],
-                        "algorithms": order, "rows": rows, "preparation": preparation, "wait": sorted(recorded[model]["wait"])})
+            timed.update(present)
+            order = discover.baseline_first(present)
+            if base in order:
+                order = [base] + [name for name in order if name != base]
+            rows, used = [], []
+            for threads, by_solver in fresh.items():
+                groups = {name: by_solver[name] for name in order if name in by_solver}
+                used += groups.values()
+                solvers = {name: {"runs": g["runs"], "best": min(g["runs"]), "median": statistics.median(g["runs"])} for name, g in groups.items()}
+                # A speed-up is only meaningful when the solvers at this thread count ran the same mesh under the
+                # same wait policy; otherwise the ratio would compare unlike runs and be misleading.
+                same = next(iter(groups.values()))
+                comparable = all(g["elements"] == same["elements"] and g["wait"] == same["wait"] for g in groups.values())
+                first = solvers.get(order[0])   # speed-up: the baseline solver's median divided by this solver's median
+                speedups = {name: first["median"] / t["median"] for name, t in solvers.items()
+                            if comparable and first and first["median"] > 0 and name != order[0] and t["median"] > 0}
+                rows.append({"threads": threads, "solvers": solvers, "speedups": speedups, "comparable": comparable, "steps": steps,
+                             "waits": {name: g["wait"] for name, g in groups.items()}})
+            preparation = {}
+            for name in order:
+                times = [ms for by_solver in fresh.values() if name in by_solver for ms in by_solver[name]["preparation"]]
+                if times:
+                    preparation[name] = min(times)
+            blocks.append({"model": model, "steps": steps, "elements": used[0]["elements"], "algorithms": order, "rows": rows,
+                           "preparation": preparation, "wait": sorted({g["wait"] for g in used if g["wait"]}), "stale": []})
+        missing += [(name, model) for name in names if name not in timed]
+        if blocks:   # out-of-date groups of solvers that do have current timings elsewhere (the others are "missing")
+            blocks[0]["stale"] = [f"{name} at {threads} thread{'' if threads == 1 else 's'} ({steps:,} steps)"
+                                  for name, threads, steps in stale if name in timed]
+        timings += blocks
     return timings, missing
 
 
 def time_missing(missing):
     """Run the solvers that have not been timed yet (one run each, no export) and add them to results/timings.csv.
-    They get the thread counts already recorded for that model, so the rows line up; otherwise the default count."""
-    import run   # run.py: builds the solvers and holds the benchmark
+    They get the workload (number of steps), thread counts and wait policy of the fullest run already recorded for
+    that model, so the rows line up; with nothing recorded, a full run at the default thread count."""
     solvers = {s.name: s for s in discover.find_solvers()}
     models = {m.stem: m for m in discover.find_models()}
     recorded = read_timings()
@@ -253,15 +333,20 @@ def time_missing(missing):
         names = [name for name, m in missing if m == model]
         if model not in models or not all(name in solvers for name in names):
             continue   # the model file or a solver source is no longer there: it stays in the "not timed" list
-        threads = sorted(recorded.get(model, {}).get("runs", {})) or [discover.default_threads()]
+        workloads = recorded.get(model, {})
+        steps = max(workloads) if workloads else 0   # 0: a full run
+        by_threads = workloads.get(steps, {})
+        threads = sorted(by_threads) or [discover.default_threads()]
+        waits = sorted({group["wait"] for by_solver in by_threads.values() for group in by_solver.values() if group["wait"]})
+        wait = waits[0] if waits else "active"
         chosen = [solvers[name] for name in names]
-        print(f"\nTiming {', '.join(names)} on {model} (not timed yet) ...", flush=True)
+        print(f"\nTiming {', '.join(names)} on {model} (wait policy {wait}) ...", flush=True)
         run.build(chosen)
-        run.benchmark(chosen, models[model], threads, repeats=1)
+        run.benchmark(chosen, models[model], threads, repeats=1, wait=wait, steps=steps)
 
 
 def print_speed(timings, missing):
-    print("\n=== Speed (fastest computation time, from results/timings.csv) ===")
+    print("\n=== Speed (median computation time, from results/timings.csv) ===")
     for model in timings:
         names = model["algorithms"]
         column = max(24, max(len(name) for name in names) + 20)
@@ -274,17 +359,28 @@ def print_speed(timings, missing):
             line = f"    {row['threads']:>7}"
             for name in names:
                 t = row["solvers"].get(name)
-                text = "-" if t is None else ms_text(t["best"])
+                text = "-" if t is None else ms_text(t["median"])
                 if name in row["speedups"]:
-                    ratio = row["speedups"][name]
-                    text += "  (same speed)" if 0.95 <= ratio < 1.05 else f"  ({ratio:.1f}x faster)" if ratio > 1 else f"  ({1 / ratio:.1f}x slower)"
+                    text += speed_text(row["speedups"][name])
                 line += f"{text:>{column}}"
             print(line)
+            if not row["comparable"]:
+                print(f"    (no speed-up shown for {row['threads']} thread{'' if row['threads'] == 1 else 's'}: {unlike_text(row)})")
+        if model["stale"]:
+            print(f"    Left out as out of date (measured before the model or the sources changed): {', '.join(model['stale'])}.")
     for model in dict.fromkeys(model for _, model in missing):
         names = [solver for solver, m in missing if m == model]
-        print(f"  Not timed on {model}: {', '.join(names)}. Run:  python3 run.py --benchmark -m {model}")
+        print(f"  Missing or out-of-date timings on {model}: {', '.join(names)}. Run:  python3 run.py --benchmark -m {model}")
     if not timings and not missing:
         print("  Nothing to time: none of the selected files is a solver result.")
+
+
+def unlike_text(row):
+    """Why a row of timings has no speed-up, e.g. 'the wait policies differ (DJTLED: default, DJTLED_fast: active)'."""
+    waits = row["waits"]
+    if len(set(waits.values())) > 1:
+        return "the wait policies differ (" + ", ".join(f"{name}: {wait or 'not recorded'}" for name, wait in waits.items()) + ")"
+    return "the runs were made on different meshes"
 
 
 # ------------------------------------------------------------------------------------------------- HTML report
@@ -331,7 +427,7 @@ def build_report(pairs, baseline, timings, missing, tolerance):
 <p class="muted">Differences are magnitudes of (result &minus; baseline) per point, in the model's length unit.</p></section>''')
 
     # speed: the solvers behind the selected results
-    missing = "".join(f'<p class="lead">Not timed on {e(model)} yet: {e(", ".join(solver for solver, m in missing if m == model))}. '
+    missing = "".join(f'<p class="lead">Missing or out-of-date timings for {e(model)}: {e(", ".join(solver for solver, m in missing if m == model))}. '
                       f'Run <code>python3 run.py --benchmark -m {e(model)}</code>, then run <code>compare.py</code> again.</p>'
                       for model in dict.fromkeys(model for _, model in missing))
     if not timings and not missing:
@@ -350,7 +446,7 @@ def build_report(pairs, baseline, timings, missing, tolerance):
                 speedups = "".join(f'<td class="num"><strong>{row["speedups"][name]:.1f}&times;</strong></td>' if name in row["speedups"]
                                    else '<td class="num">&ndash;</td>' for name in names[1:])
                 quickest = min((t["best"] for t in row["solvers"].values()), default=None)
-                per_step = f'{1000 * quickest / model["steps"]:.1f} &micro;s' if quickest is not None and model["steps"] else "&ndash;"
+                per_step = f'{1000 * quickest / row["steps"]:.1f} &micro;s' if quickest is not None and row.get("steps") else "&ndash;"
                 rows.append(f'<tr><td class="num">{row["threads"]}</td>{"".join(cells)}{speedups}<td class="num">{per_step}</td></tr>')
             legend = "".join(f'<span><i class="swatch s{i + 1}"></i>{e(name)}{" (baseline)" if i == 0 and len(names) > 1 else ""}</span>'
                              for i, name in enumerate(names[:8]))
@@ -364,10 +460,12 @@ def build_report(pairs, baseline, timings, missing, tolerance):
 <tr>{head2}</tr></thead>
 <tbody>{"".join(rows)}</tbody></table></div>
 <p class="muted">Every solver ran with the same thread count in each row{", and with the " + e(model["wait"][0]) + " wait policy" if len(model["wait"]) == 1 else ""}.
+{"".join(" No speed-up is shown for " + str(r["threads"]) + (" thread: " if r["threads"] == 1 else " threads: ") + e(unlike_text(r)) + "." for r in model["rows"] if not r["comparable"])}
+{(" Left out as out of date (measured before the model or the sources changed): " + e(", ".join(model["stale"])) + ".") if model["stale"] else ""}
 {("Preparation (reading the model and set-up, not part of the computation time), fastest run: " + "; ".join(f"{e(name)} {ms_text(model['preparation'][name])}" for name in names if name in model["preparation"]) + ".") if model["preparation"] else ""}</p>''')
         parts.append(f'''<section class="card"><h2>Speed</h2>
-<p class="lead">Computation time of the time loop only (no file reading, no VTK export), from <code>results/timings.csv</code>.
-Speed-up is the baseline solver's fastest run divided by the other solver's fastest run at the same thread count.</p>
+<p class="lead">Computation time of the time loop only (no file reading, no export), from <code>results/timings.csv</code>.
+Speed-up is the baseline solver's median run divided by the other solver's median run at the same thread count.</p>
 {"".join(blocks)}{missing}</section>''')
     else:
         parts.append(f'<section class="card"><h2>Speed</h2>{missing}</section>')
@@ -629,18 +727,6 @@ darkQuery.addEventListener("change", drawAll);
 
 
 # ------------------------------------------------------------------------------------------------- choosing what to compare
-def ask(title, options):
-    """Print a numbered menu and return the index of the chosen option."""
-    print(f"\n{title}")
-    for i, text in enumerate(options, 1):
-        print(f"  {i}) {text}")
-    while True:
-        answer = input(f"Enter a number (1-{len(options)}): ").strip()
-        if answer.isdigit() and 1 <= int(answer) <= len(options):
-            return int(answer) - 1
-        print("  Please type one of the numbers above.")
-
-
 def find_file(name, candidates, what):
     """Accept a name with or without '_deformed' / '.vtk', or a path to a .vtk file."""
     for c in candidates:
@@ -682,9 +768,12 @@ def main():
 
     results, references = discover.find_results(), discover.find_references()
     everything = references + results
-    if not results:
-        sys.exit(f"No results found in {RESULTS}. Run a solver first:  python3 run.py")
-    label = lambda path: f"{short(path)}  ({'reference' if path in references else 'result'}, {discover.point_count(path):,} points)"
+    if not everything:
+        sys.exit(f"No results in {RESULTS} and no references in {REFERENCES}. Run a solver first:  python3 run.py")
+    def points_text(path):   # a file without a POINTS line near its top has no count
+        count = discover.point_count(path)
+        return "unknown number of points" if count is None else f"{count:,} points"
+    label = lambda path: f"{short(path)}  ({'reference' if path in references else 'result'}, {points_text(path)})"
 
     # the one baseline
     if args.one:
@@ -701,7 +790,7 @@ def main():
             others = list(dict.fromkeys(find_file(name, everything, "result or reference") for name in args.others))
     else:
         if not candidates:
-            sys.exit(f"Nothing else has the same number of points as {short(one)} ({discover.point_count(one):,}), so there is nothing to compare it with.")
+            sys.exit(f"Nothing else has the same number of points as {short(one)} ({points_text(one)}), so there is nothing to compare it with.")
         mode = ask(f"Compare {short(one)} with:", ["one other", "several others", f"all others ({len(candidates)})"])
         if mode == 0:
             others = [candidates[ask("Which one?", [label(path) for path in candidates])]]
@@ -721,7 +810,11 @@ def main():
     timings, missing = speed_of([one] + others, one)
     if missing and not args.no_timing:
         listed = ", ".join(f"{solver} on {model}" for solver, model in missing)
-        if (args.one and args.others) or input(f"\nNot timed yet: {listed}. Run them now to get their speed? [Y/n]: ").strip().lower() in ("", "y", "yes"):
+        if args.one and args.others:
+            # non-interactive: never start a surprise re-run (the large model is minutes); just say what to run
+            print(f"\nMissing or out-of-date timings for: {listed}.")
+            print(f"Run  python3 run.py --benchmark  to measure them, then run compare.py again.")
+        elif input(f"\nMissing or out-of-date timings for: {listed}. Run them now to get their speed? [Y/n]: ").strip().lower() in ("", "y", "yes"):
             time_missing(missing)
             timings, missing = speed_of([one] + others, one)
     print_speed(timings, missing)

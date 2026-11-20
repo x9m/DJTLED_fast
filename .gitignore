@@ -6,3 +6,6 @@ results/
 .DS_Store
 __pycache__/
 .claude/
+
+# Editor settings that hold paths of one machine
+.vscode/

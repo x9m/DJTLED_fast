@@ -13,6 +13,7 @@ or a reference file is renamed, added or removed. Only the folder names are fixe
 run.py compiles each solver with its own name (-DSOLVER_NAME="<name>"), and the solver puts that name in front of its
 output files. That is how a result file can be traced back to its solver and model here.
 """
+import hashlib
 import os
 import platform
 import re
@@ -59,8 +60,8 @@ def headers():
 
 
 def find_results():
-    """The final-state files written by the solvers."""
-    return sorted(RESULTS.glob("*_deformed.vtk"))
+    """The final-state files written by the solvers (partial `_stepsN_` runs are not results)."""
+    return sorted(p for p in RESULTS.glob("*_deformed.vtk") if not re.search(r"_steps\d+_", p.name))
 
 
 def find_references():
@@ -98,7 +99,55 @@ def default_threads():
     return os.cpu_count() or 1
 
 
-_point_counts = {}
+def _strip_c_comments(text):
+    """Remove C/C++ comments and collapse whitespace, so a comment-only edit does not change a fingerprint."""
+    out = []
+    i, n = 0, len(text)
+    in_block = False
+    while i < n:
+        if in_block:
+            if text.startswith("*/", i):
+                in_block = False
+                i += 2
+            else:
+                i += 1
+        elif text.startswith("//", i):
+            while i < n and text[i] not in "\r\n":
+                i += 1
+        elif text.startswith("/*", i):
+            in_block = True
+            i += 2
+        elif text[i] in " \t\r\n":
+            if out and out[-1] != " ":
+                out.append(" ")
+            i += 1
+        else:
+            out.append(text[i])
+            i += 1
+    return "".join(out)
+
+
+_stripped = {}   # (file, time of its last change) -> its content without comments
+
+
+def file_fingerprint(*paths):
+    """A short hash of the meaningful (non-comment) content of the given files. Used to tie a benchmark observation
+    to the exact model and solver source it was measured with, so stale timings are recognised after a code edit.
+    A file is read and stripped once, however many fingerprints it is part of (the model and the shared sources are
+    in every solver's fingerprint, and stripping the large model takes most of a second)."""
+    h = hashlib.md5()
+    for p in paths:
+        try:
+            key = (str(p), p.stat().st_mtime_ns)
+            if key not in _stripped:
+                _stripped[key] = _strip_c_comments(p.read_text(errors="replace")).encode("utf-8", errors="replace")
+            h.update(_stripped[key])
+        except OSError:
+            h.update(b"?")   # a missing file still changes the hash, so its old rows are invalidated
+    return h.hexdigest()[:16]
+
+
+_point_counts = {}   # (file, time of its last change) -> number of points
 
 
 def point_count(vtk_file):

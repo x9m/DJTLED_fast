@@ -14,14 +14,14 @@ integration, in single precision, parallelised with OpenMP.
 
 | Solver | Source | What it is |
 |---|---|---|
-| `DJTLED` | `src/DJTLED.cpp` | The original code by Jinao Zhang, modified to build on macOS |
+| `DJTLED` | `src/DJTLED.cpp` | Zhang's original code, edited only so both solvers share the same validation, boundary-condition rules, timing and output (the element kernel is unchanged) |
 | `DJTLED_fast` | `src/DJTLED_fast.cpp` | The same algorithm and input format, reorganised for speed |
 
 ## Results
 
 Measured on an Apple-silicon MacBook Air (M5) with 4 performance and 6 efficiency cores. Times are for the time loop
 only, with no file reading, set-up or VTK export. Both solvers were given the same thread count, and `DJTLED` is shown
-with whichever OpenMP wait policy (active or passive) was faster for it.
+with whichever OpenMP wait policy (active, or the runtime's default as distributed) was faster for it.
 
 **Speed, small model** (`NH_001_tension`: 6,713 elements, complete run of 4,000 steps; median of 5 runs):
 
@@ -50,10 +50,12 @@ when run straight afterwards on the warm machine, and 45.4 s in a separate run f
 
 | Model | DJTLED vs reference | DJTLED_fast vs reference | DJTLED_fast vs DJTLED |
 |---|---|---|---|
-| `NH_001_tension` | 0.0015 % | 0.0017 % | 0.0016 % |
+| `NH_001_tension` | 0.0015 % | 0.0018 % | 0.0017 % |
 | `NH_0002_tension` | 0.051 % | 0.043 % | 0.042 % |
 
-These numbers come from one machine that slows down when it gets warm, so treat the timings as indicative. You can
+These numbers come from one machine that slows down when it gets warm, so treat the timings as indicative. The
+small-model times include a wake-up cost of about 8 to 25 ms from the cooling pause between runs; the speed-ups are
+therefore slightly conservative (about 2.4–3.1× without that pause). You can
 reproduce them with the commands below. The full study, with the method behind every change, is in
 [A Faster DJ-TLED (paper).pdf](<A Faster DJ-TLED (paper).pdf>).
 
@@ -90,7 +92,8 @@ python3 run.py --benchmark -m NH_001_tension -t 1,4,10      # speed comparison, 
 | `-a`, `--algorithm` | A solver name, a part of it that fits only one solver (for example `fast`), or `all` |
 | `-e`, `--export` | `both` (animation and final state), `animation`, `final` or `none` |
 | `-t`, `--threads` | Number of threads, the same for every solver. Without it: the number of performance cores |
-| `--wait` | OpenMP wait policy, the same for every solver: `active` (default) or `passive` (for a busy machine) |
+| `--wait` | OpenMP wait policy, the same for every solver: `active` (default) or `passive` (for a busy machine). `default` sets no policy, so each solver runs as distributed: `DJTLED` with the runtime's default, `DJTLED_fast` still with active waiting. The timings record the policy each solver reports, and no speed-up is shown between solvers whose policies differ |
+| `--steps` | Stop every solver after N steps (a partial run, see below); also works with `--benchmark`, where partial and full runs are kept as separate timings |
 | `-b`, `--benchmark` | Time the solvers without any export and save the times in `results/timings.csv` |
 | `--repeats` | Runs per solver and thread count in a benchmark (default 3) |
 | `--pause` | Seconds to wait between benchmark runs so the machine can cool down (default 2) |
@@ -114,6 +117,11 @@ for `djtled`.
 
 `djtled_fast` also accepts `--no-reorder`, which switches off its node and element reordering.
 
+Both solvers accept `--steps N`, which stops after N steps (N up to the full step count) while keeping the loading
+ramp over the full total time. It reproduces a partial run, such as the first 2,001 steps of the large model:
+`./build/djtled_fast models/NH_0002_tension.txt --export none --threads 4 --steps 2001`. When `--steps` caps the run,
+any output files are named `<solver>_stepsN_<model>_…` so a partial run does not overwrite the full one.
+
 ## Comparing results: `compare.py`
 
 You pick one baseline, either a solver result or a reference file, and what to compare with it:
@@ -131,8 +139,10 @@ python3 compare.py --one DJTLED_NH_001_tension --with all                       
   comparison passes when its largest difference is at most `--tol` percent (default 0.5) of the largest displacement
   in the baseline. The exit code is 1 if any comparison fails.
 - **Speed.** The computation times of the solvers behind the selected results, with the speed-up against the
-  baseline's solver. A solver that has not been timed on that model yet is timed on the spot with one run; use
-  `--no-timing` to skip that.
+  baseline's solver. A solver that has not been timed on that model yet (or whose timings are out of date) is timed
+  after you confirm, using the menus; `--no-timing` skips that, and a non-interactive `--one … --with` run never
+  re-times on its own. Timings of a full run and of a partial run (`--steps`) are shown as separate tables, and a
+  row shows no speed-up when its solvers did not run with the same wait policy.
 
 It writes to `results/`:
 
@@ -153,10 +163,14 @@ The solvers write to `results/`, named after the solver and the model:
 |---|---|
 | `<solver>_<model>_deformed.vtk` | Final state, deformed mesh with the displacement field |
 | `<solver>_<model>_undeformed.vtk` | Final state on the undeformed mesh |
-| `<solver>_<model>_animation.pvd` | The animation; open this file in ParaView |
-| `<solver>_<model>_timesteps/` | The animation's frames, about 100 per run |
+| `<solver>_<model>_animation.xdmf` | The animation; open this file in ParaView and choose the "XDMF Reader" |
+| `<solver>_<model>_timesteps/` | The animation's data: the elements once (`topology.bin`), and the deformed coordinates and displacements of each frame (raw binary), about 100 frames per run |
 
-The animation of the large model is roughly 1.5 GB per solver. Use `-e final` to skip it.
+The animation of the large model is about 170 MB per solver; use `-e final` to skip it. The elements do not change
+during a run, so they are stored once and every frame refers to them (the earlier one-VTK-file-per-frame animation
+repeated them in each frame and took about 1 GB). The `.xdmf` file refers to the data by relative path, so keep it
+next to its `_timesteps/` folder. The data files are raw 32-bit values in the byte order of the machine that wrote
+them, which the `.xdmf` file records.
 
 ## Models
 
@@ -166,7 +180,10 @@ The animation of the large model is roughly 1.5 GB per solver. Use `-e final` to
 | `NH_0002_tension` | 67,362 | 361,175 | 0.000025 | 40,000 |
 
 Both are a cube pulled by 0.05 in y on one face over a total time of 1, with a neo-Hookean material (μ = 6,567,
-K = 326,210) and density 1,060. `reference/` holds a reference result for each.
+K = 326,210) and density 1,060. In both models the pulled face is also fixed in x and z, and the opposite face is
+fixed in all directions. `reference/` holds a reference result for each. These two models and their references were
+prepared for this study; they are not part of Zhang's upstream repository (which ships different examples), and the
+exact build and step that produced each reference file is not recorded.
 
 A model is a plain text file:
 
@@ -197,8 +214,8 @@ Two things to know when making or changing a model:
 - **The time step has a stability limit.** If it is too large the run stops with "an element inverted" or "solution
   diverged". On `NH_0002_tension` the limit is between 0.00004 and 0.000045.
 - **Results are single precision.** On the large model, changing the time step moves the final displacements by up
-  to about 0.3 % of the prescribed displacement, with no smooth trend. Differences smaller than that between two
-  runs are rounding, not error.
+  to about 0.3 % of the prescribed displacement, with no smooth trend. A difference smaller than that between two
+  runs is not evidence of an error in either solver.
 
 ## What makes `DJTLED_fast` faster
 
@@ -206,15 +223,18 @@ Two things to know when making or changing a model:
   and the element kernel processes eight elements at once with SIMD.
 - **A cheaper J^(-2/3).** It is refined from the previous step's value with two Newton iterations instead of a
   call to `powf`, with an exact fallback when the previous value is too far off.
-- **One division instead of nine** in the element force, by using the adjugate of the Jacobian.
+- **One division instead of ten** in the element force, by using the adjugate of the Jacobian and a stored
+  reciprocal of the initial determinant.
 - **One thread team for the whole run**, with spinning rather than sleeping between the two phases of a step.
 - **Node and element reordering** (reverse Cuthill–McKee), so neighbouring data sits close together in memory.
 - **One thread per performance core** by default on Apple silicon.
 
 It also checks that no element is inverted, both in the input mesh and at every step.
 
-Compile-time settings at the top of `src/DJTLED_fast.cpp` (`FAST_W`, `FAST_SPIN`, `FAST_PCORES`) can be overridden
-with `-DNAME=value`.
+Compile-time settings at the top of `src/DJTLED_fast.cpp` (`FAST_W`, `FAST_SPIN`, `FAST_PCORES`, `FAST_POWF`,
+`FAST_PERSTEP`, `J23_TOL`, `J23_ITERS`) can be overridden with `-DNAME=value` when compiling by hand; `run.py`
+always builds with the defaults. `FAST_POWF` and `FAST_PERSTEP` are the two paper ablations (`powf` instead of the
+warm-started iteration, and one parallel region per step).
 
 ## Project layout
 
@@ -232,8 +252,9 @@ A Faster DJ-TLED (paper).pdf / .tex   the paper comparing the two solvers, and i
 
 Nothing in the scripts is tied to particular file names. Any `.txt` file in `models/` is a model, any `.cpp` file in
 `src/` with a `main()` is a solver, and any `.vtk` file in `reference/` is a reference. To add a solver, put its
-source in `src/`; it must accept `--export` and `--threads`, write its files through `vtk_export`, and print a
-`Computation time:` line (and, to have it reported, a `Preparation time:` line).
+source in `src/`; it must accept `--export` and `--threads` (and `--steps`, if you use that option of `run.py`), write its files through `vtk_export`, and print the lines
+the scripts read: `using N threads`, `Computation time: N ms`, `NumSteps: N` and `Elements: N` (and, to have them
+reported, `Preparation time: N ms` and, after the thread count, `(wait policy: NAME)`).
 
 ## Licence
 

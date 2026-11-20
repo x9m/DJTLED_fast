@@ -43,8 +43,15 @@ SOFTWARE.
 #ifndef J23_ITERS         // ... refined by this many Newton iterations (2 iterations at 1e-2: relative error < 1e-8)
 #define J23_ITERS 2
 #endif
+#ifndef FAST_POWF         // 1: ablation — use powf for J^(-2/3) in every element instead of the warm-started iteration
+#define FAST_POWF 0
+#endif
+#ifndef FAST_PERSTEP      // 1: ablation — open a parallel region per step instead of one team for the whole time loop
+#define FAST_PERSTEP 0
+#endif
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -98,6 +105,7 @@ static bool readModel(const char* fname, Model& m)
     {
         if (m.X.empty()) { m.node_begin_index = idx; }
         if (idx - m.node_begin_index != m.nodes()) { return readError(file, "node indices must be consecutive."); }
+        if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) { return readError(file, "node coordinates must be finite."); }
         m.X.push_back(x); m.X.push_back(y); m.X.push_back(z);
     }
     if (m.X.empty()) { return readError(file, "no nodes found."); }
@@ -105,9 +113,13 @@ static bool readModel(const char* fname, Model& m)
     m.material_type = buffer;
     if (m.material_type != "NH") { return readError(file, "unsupported material type: " + m.material_type); }
     if (fscanf(file, "%f %f", &m.mu, &m.K) != 2) { return readError(file, "NH material needs two values (Mu K)."); }
-    if (fscanf(file, "%255s %f", buffer, &m.rho) != 2) { return readError(file, "missing Density."); }
+    if (!std::isfinite(m.mu) || !std::isfinite(m.K)) { return readError(file, "NH material values must be finite."); }
+    if (!(m.mu > 0.f) || !(m.K > 0.f)) { return readError(file, "NH material needs positive Mu and K."); }
+    if (fscanf(file, "%255s %f", buffer, &m.rho) != 2 || string(buffer) != "Density") { return readError(file, "missing or misspelled Density line."); }
+    if (!(m.rho > 0.f) || !std::isfinite(m.rho)) { return readError(file, "Density must be a positive finite number."); }
     if (fscanf(file, "%255s", buffer) != 1) { return readError(file, "missing element type."); }
     m.ele_type = buffer;
+    if (m.ele_type != "T4") { return readError(file, "unsupported element type: " + m.ele_type + " (only T4 is supported)."); }
     const size_t num_nodes = m.nodes();
     unsigned int n_idx[4] = { 0, 0, 0, 0 };
     while (fscanf(file, "%u %u %u %u %u", &idx, &n_idx[0], &n_idx[1], &n_idx[2], &n_idx[3]) == 5) // internally, ele index starts at 0
@@ -141,17 +153,23 @@ static bool readModel(const char* fname, Model& m)
         {
             float u(0.f);
             if (fscanf(file, "%255s %f", buffer, &u) != 2) { return readError(file, "<Disp> needs a direction and a magnitude."); }
-            DispBC bc{ dirOf(buffer), u, {} };
+            const int dir = dirOf(buffer);
+            if (dir < 0 || dir > 2) { return readError(file, "unknown <Disp> direction '" + string(buffer) + "' (use x, y or z)."); }
+            if (!std::isfinite(u)) { return readError(file, "<Disp> magnitude must be finite."); }
+            DispBC bc{ dir, u, {} };
             if (!readNodes(bc.nodes)) { return readError(file, "<Disp> refers to an unknown node."); }
-            if (bc.dir >= 0 && bc.dir <= 2) { m.disp.push_back(bc); }
+            if (bc.nodes.empty()) { return readError(file, "<Disp> must name at least one node."); }
+            m.disp.push_back(bc);
             m.num_BCs++;
         }
         else if (BC_type == "<FixP>") // Fixed positions
         {
             if (fscanf(file, "%255s", buffer) != 1) { return readError(file, "<FixP> needs a direction."); }
             const int d = dirOf(buffer);
+            if (d < 0) { return readError(file, "unknown <FixP> direction '" + string(buffer) + "' (use x, y, z or all)."); }
             vector<unsigned int> list;
             if (!readNodes(list)) { return readError(file, "<FixP> refers to an unknown node."); }
+            if (list.empty()) { return readError(file, "<FixP> must name at least one node."); }
             if (d >= 0 && d <= 2) { m.fix.push_back({ d, list }); }
             if (d == 3) { for (int k = 0; k < 3; k++) { m.fix.push_back({ k, list }); } }
             m.num_BCs++;
@@ -161,18 +179,30 @@ static bool readModel(const char* fname, Model& m)
             float g(0.f);
             if (fscanf(file, "%255s %f", buffer, &g) != 2) { return readError(file, "<Gravity> needs a direction and a magnitude."); }
             const int d = dirOf(buffer);
-            if (d >= 0 && d <= 2) { m.grav.push_back({ d, g }); }
+            if (d < 0 || d > 2) { return readError(file, "unknown <Gravity> direction '" + string(buffer) + "' (use x, y or z)."); }
+            if (!std::isfinite(g)) { return readError(file, "<Gravity> magnitude must be finite."); }
+            m.grav.push_back({ d, g });
             m.num_BCs++;
         }
         else if (BC_type == "</BC>") { found_end = true; break; }
+        else { return readError(file, "unknown boundary-condition tag '" + BC_type + "' (expected <Disp>, <FixP>, <Gravity> or </BC>)."); }
     }
     if (!found_end) { return readError(file, "missing </BC>."); }
-    if (fscanf(file, "%255s %f", buffer, &m.alpha)   != 2) { return readError(file, "missing Damping."); }
-    if (fscanf(file, "%255s %f", buffer, &m.dt)      != 2) { return readError(file, "missing TimeStep."); }
-    if (fscanf(file, "%255s %f", buffer, &m.total_t) != 2) { return readError(file, "missing TotalTime."); }
+    if (fscanf(file, "%255s %f", buffer, &m.alpha)   != 2 || string(buffer) != "Damping")   { return readError(file, "missing or misspelled Damping line."); }
+    if (fscanf(file, "%255s %f", buffer, &m.dt)      != 2 || string(buffer) != "TimeStep")  { return readError(file, "missing or misspelled TimeStep line."); }
+    if (fscanf(file, "%255s %f", buffer, &m.total_t) != 2 || string(buffer) != "TotalTime") { return readError(file, "missing or misspelled TotalTime line."); }
     fclose(file);
-    if (!(m.dt > 0.f) || !(m.total_t > 0.f)) { return readError(nullptr, "TimeStep and TotalTime must be positive."); }
-    m.num_steps = (size_t)ceil(m.total_t / m.dt);   // same formula as DJTLED.cpp
+    if (!(m.dt > 0.f) || !(m.total_t > 0.f) || !std::isfinite(m.dt) || !std::isfinite(m.total_t) || !std::isfinite(m.alpha) || !std::isfinite(m.total_t / m.dt))
+    { return readError(nullptr, "Damping, TimeStep and TotalTime must be finite, and TimeStep and TotalTime positive."); }
+    {
+        // single-precision division can round a clean ratio (e.g. 0.05 / 0.000025) just above its integer, so
+        // ceil would add one extra step; snap ratios that are within float noise of an integer, then take ceil.
+        const double ratio = (double)m.total_t / (double)m.dt;
+        const double nearest = std::llround(ratio);
+        const double adjusted = (std::fabs(ratio - nearest) <= 1e-6 * std::max(1.0, std::fabs(ratio))) ? nearest : ratio;
+        m.num_steps = (size_t)std::ceil(adjusted);
+        if (m.num_steps == 0) { m.num_steps = 1; }
+    }
     return true;
 }
 
@@ -186,8 +216,9 @@ struct alignas(W >= 4 ? 64 : 4) EBlock
     float    invDetJ0[W];
     float    KV[W];          // K Vol
 };
-struct alignas(W >= 4 ? 64 : 4) FBlock { float f[12][W]; };   // element nodal forces [3 * local node + xyz][lane]
-constexpr size_t FSTRIDE = sizeof(FBlock) / sizeof(float);   // floats per FBlock (> 12 * W when the alignment pads it)
+// Element nodal forces are stored as one flat array: block b occupies [b * FSTRIDE, (b+1) * FSTRIDE),
+// component c of lane l at [b * FSTRIDE + c * W + l]. This keeps all indexing inside a single vector<float>.
+constexpr size_t FSTRIDE = 12 * (size_t)W;   // floats per block (12 force components x W lanes)
 
 enum : uint8_t { DOF_FREE = 0, DOF_FIXED = 1, DOF_DISP = 2 };
 enum { STOP_NAN = 1, STOP_INVERTED = 2 };   // why the time loop stopped: a displacement became NaN / an element inverted (J <= 0)
@@ -197,7 +228,7 @@ struct Solver
     size_t                 nn = 0, ne = 0, nb = 0;
     vector<uint32_t>       newOfOld, oldOfNew;            // node numbering
     vector<EBlock>         blocks;
-    vector<FBlock>         Fe;
+    vector<float>          Fe;                            // flat force buffer, nb * FSTRIDE floats
     vector<float>          J23;                           // J^(-2/3) warm starts, nb * W
     vector<uint32_t>       nptr, noff;                    // node i: force offsets noff[nptr[i] .. nptr[i+1])
     vector<float>          c1, c2, c3, fext, dmag;        // per DOF (solver numbering)
@@ -266,6 +297,7 @@ static vector<uint32_t> rcmOrder(size_t nn, const vector<array<unsigned, 4>>& te
 static bool setup(const Model& m, Solver& s, const bool reorder)
 {
     s.nn = m.nodes(); s.ne = m.tets.size(); s.nb = (s.ne + W - 1) / W;
+    if (s.ne > (size_t)UINT32_MAX / 12) { cerr << "\n\tError: mesh is too large for the internal 32-bit counters (adjacency counts 12 entries per element)." << endl; return false; }
     // node and element order
     if (reorder) { s.oldOfNew = rcmOrder(s.nn, m.tets); }
     else { s.oldOfNew.resize(s.nn); for (size_t i = 0; i < s.nn; i++) { s.oldOfNew[i] = (uint32_t)i; } }
@@ -286,7 +318,7 @@ static bool setup(const Model& m, Solver& s, const bool reorder)
     }
     // element blocks (precomputed in double, stored in float); padding lanes are inert (J0 = I, zero stiffness)
     s.blocks.assign(s.nb, EBlock{});
-    s.Fe.assign(s.nb, FBlock{});
+    s.Fe.assign((size_t)s.nb * FSTRIDE, 0.f);
     s.J23.assign(s.nb * W, 1.f);
     vector<double> nodal_mass(s.nn, 0.0), gforce(3 * s.nn, 0.0);
     vector<uint32_t> cnt(s.nn + 1, 0);
@@ -340,6 +372,8 @@ static bool setup(const Model& m, Solver& s, const bool reorder)
             for (const auto& g : m.grav) { gforce[3 * (size_t)v + g.first] += mass * g.second / 4.0; }
         }
     }
+    // reject isolated nodes (zero mass would make the central-difference constants divide by zero)
+    for (size_t i = 0; i < s.nn; i++) { if (!(nodal_mass[i] > 0.0)) { cerr << "\n\tError: node " << s.oldOfNew[i] + m.node_begin_index << " is not part of any element (zero mass)." << endl; return false; } }
     // node -> element force offsets (CSR, elements in solver order)
     s.nptr.assign(s.nn + 1, 0);
     for (size_t i = 0; i < s.nn; i++) { s.nptr[i + 1] = s.nptr[i] + cnt[i + 1]; }
@@ -362,9 +396,9 @@ static bool setup(const Model& m, Solver& s, const bool reorder)
         s.fext[i] = (float)gforce[i];
     }
     for (const auto& f : m.fix) { for (unsigned int n : f.second) { s.kind[3 * (size_t)s.newOfOld[n] + f.first] = DOF_FIXED; } }
-    for (const auto& d : m.disp) { for (unsigned int n : d.nodes) { s.dmag[3 * (size_t)s.newOfOld[n] + d.dir] = d.mag; } }
-    for (size_t i = 0; i < nd; i++) { if (s.dmag[i] != 0.f) { s.kind[i] = DOF_DISP; } }   // DJTLED.cpp: Disp (if non-zero) wins over FixP
+    for (const auto& d : m.disp) { for (unsigned int n : d.nodes) { const size_t di = 3 * (size_t)s.newOfOld[n] + d.dir; s.dmag[di] = d.mag; s.kind[di] = DOF_DISP; } }   // Disp wins over FixP; a zero magnitude still constrains the DOF
     for (auto& u : s.U) { u.assign(nd, 0.f); }
+    for (size_t i = 0; i < nd; i++) { s.U[0][i] = 0.5f * m.dt * m.dt * s.fext[i] / (float)nodal_mass[i / 3]; }   // start from rest under the initial acceleration
     return true;
 }
 
@@ -375,7 +409,7 @@ static bool setup(const Model& m, Solver& s, const bool reorder)
 //            inverted (J <= 0; the warm start works with J^2 and would not notice the sign), so that EXACT = 1 follows.
 // EXACT = 1: J^(-2/3) = powf(J, -2/3); returns 2 if the element is inverted (J <= 0 or NaN), else 0.
 template <int EXACT>
-static FORCE_INLINE int laneForces(const EBlock& __restrict E, const int l, const float (&u)[12][W], float* __restrict y_cache, float (&f)[12][W])
+static FORCE_INLINE int laneForces(const EBlock& __restrict E, const int l, const float (&u)[12][W], float* __restrict y_cache, float* __restrict f)
 {
     // Eq. (11): Jt = J0 + displacement differences
     const float a00 = E.J0[0][l] - u[0][l] + u[3][l], a01 = E.J0[1][l] - u[1][l] + u[4][l],  a02 = E.J0[2][l] - u[2][l] + u[5][l];
@@ -403,34 +437,40 @@ static FORCE_INLINE int laneForces(const EBlock& __restrict E, const int l, cons
     }
     y_cache[l] = y;
     const float c = (-(1.f / 3.f) * y * PG + E.KV[l] * J * (J - 1.f)) / det;   // const1 / det: const1 * invJt = c * adj(Jt)
-    f[3][l]  = y * (a00 * P00 + a10 * P01 + a20 * P02) + c * i00;
-    f[4][l]  = y * (a01 * P00 + a11 * P01 + a21 * P02) + c * i10;
-    f[5][l]  = y * (a02 * P00 + a12 * P01 + a22 * P02) + c * i20;
-    f[6][l]  = y * (a00 * P01 + a10 * P11 + a20 * P12) + c * i01;
-    f[7][l]  = y * (a01 * P01 + a11 * P11 + a21 * P12) + c * i11;
-    f[8][l]  = y * (a02 * P01 + a12 * P11 + a22 * P12) + c * i21;
-    f[9][l]  = y * (a00 * P02 + a10 * P12 + a20 * P22) + c * i02;
-    f[10][l] = y * (a01 * P02 + a11 * P12 + a21 * P22) + c * i12;
-    f[11][l] = y * (a02 * P02 + a12 * P12 + a22 * P22) + c * i22;
-    f[0][l] = -f[3][l] - f[6][l] - f[9][l];
-    f[1][l] = -f[4][l] - f[7][l] - f[10][l];
-    f[2][l] = -f[5][l] - f[8][l] - f[11][l];
+    f[3*W + l]  = y * (a00 * P00 + a10 * P01 + a20 * P02) + c * i00;
+    f[4*W + l]  = y * (a01 * P00 + a11 * P01 + a21 * P02) + c * i10;
+    f[5*W + l]  = y * (a02 * P00 + a12 * P01 + a22 * P02) + c * i20;
+    f[6*W + l]  = y * (a00 * P01 + a10 * P11 + a20 * P12) + c * i01;
+    f[7*W + l]  = y * (a01 * P01 + a11 * P11 + a21 * P12) + c * i11;
+    f[8*W + l]  = y * (a02 * P01 + a12 * P11 + a22 * P12) + c * i21;
+    f[9*W + l]  = y * (a00 * P02 + a10 * P12 + a20 * P22) + c * i02;
+    f[10*W + l] = y * (a01 * P02 + a11 * P12 + a21 * P22) + c * i12;
+    f[11*W + l] = y * (a02 * P02 + a12 * P12 + a22 * P22) + c * i22;
+    f[0*W + l] = -f[3*W + l] - f[6*W + l] - f[9*W + l];
+    f[1*W + l] = -f[4*W + l] - f[7*W + l] - f[10*W + l];
+    f[2*W + l] = -f[5*W + l] - f[8*W + l] - f[11*W + l];
     return bad;
 }
 
-// Forces of one block of W elements, stored in F. U: displacements addressed by E.n.
+// Forces of one block of W elements, stored in F (a flat array of FSTRIDE floats). U: displacements addressed by E.n.
 // Returns the number of exact J^(-2/3) fall-backs; sets inverted if an element of the block has J <= 0.
-static inline int blockForces(const EBlock& __restrict E, const float* __restrict U, float* __restrict y_cache, FBlock* __restrict F, int& inverted)
+static inline int blockForces(const EBlock& __restrict E, const float* __restrict U, float* __restrict y_cache, float* __restrict F, int& inverted)
 {
     float u[12][W];
     for (int a = 0; a < 4; a++) { for (int l = 0; l < W; l++) { const float* p = U + E.n[a][l]; u[3 * a][l] = p[0]; u[3 * a + 1][l] = p[1]; u[3 * a + 2][l] = p[2]; } }
-    float (&f)[12][W] = F->f;
+#if FAST_POWF
+    // ablation: always use powf (no warm-started iteration), so there are no fall-backs to count
+    int bad[W];
+    for (int l = 0; l < W; l++) { bad[l] = laneForces<1>(E, l, u, y_cache, F); if (bad[l] == 2) { inverted = 1; } }
+    return 0;
+#else
     int bad[W], any_bad = 0;
 #pragma omp simd reduction(|:any_bad)
-    for (int l = 0; l < W; l++) { bad[l] = laneForces<0>(E, l, u, y_cache, f); any_bad |= bad[l]; }
+    for (int l = 0; l < W; l++) { bad[l] = laneForces<0>(E, l, u, y_cache, F); any_bad |= bad[l]; }
     int n = 0;
-    if (any_bad) { for (int l = 0; l < W; l++) { if (bad[l]) { if (laneForces<1>(E, l, u, y_cache, f) == 2) { inverted = 1; } n++; } } }   // rare
+    if (any_bad) { for (int l = 0; l < W; l++) { if (bad[l]) { if (laneForces<1>(E, l, u, y_cache, F) == 2) { inverted = 1; } n++; } } }   // rare
     return n;
+#endif
 }
 
 // Explicit central-difference update of node i with internal force f. Returns true if a NaN appeared.
@@ -464,24 +504,24 @@ static inline bool nodeUpdate(const Solver& s, const size_t i, const float nfac,
 
 /*------------------------------------------------------------------------------------------------- time loop */
 // One explicit step, called by every thread of a parallel region (orphaned work-sharing loops, 2 barriers).
-// Un = new displacements from Uc (current) and Up (previous). Adds STOP_INVERTED / STOP_NAN to *stop.
+// Un = new displacements from Uc (current) and Up (previous). Adds STOP_INVERTED / STOP_NAN to *stop (this step's flag).
 static void step(Solver& s, const float nfac, const float* __restrict Uc, const float* __restrict Up, float* __restrict Un,
                  long long& fallbacks, int* stop)
 {
     // element pass: forces of every element block, then node pass: gather and update
-#pragma omp for schedule(runtime)
+#pragma omp for schedule(static)
     for (long b = 0; b < (long)s.nb; b++)
     {
         int inverted = 0;
-        fallbacks += blockForces(s.blocks[b], Uc, &s.J23[(size_t)b * W], &s.Fe[b], inverted);
+        fallbacks += blockForces(s.blocks[b], Uc, &s.J23[(size_t)b * W], &s.Fe[(size_t)b * FSTRIDE], inverted);
         if (inverted)
         {
 #pragma omp atomic
             *stop |= STOP_INVERTED;
         }
     }
-    const float* Fe = &s.Fe[0].f[0][0];
-#pragma omp for schedule(runtime)
+    const float* Fe = s.Fe.data();
+#pragma omp for schedule(static)
     for (long i = 0; i < (long)s.nn; i++)
     {
         if (nodeUpdate(s, (size_t)i, nfac, Fe, Uc, Up, Un))
@@ -492,13 +532,54 @@ static void step(Solver& s, const float nfac, const float* __restrict Uc, const 
     }
 }
 
+// Validate the final displacement field before it is accepted and exported: every value finite, no element inverted.
+static bool finalStateValid(const Solver& s)
+{
+    const float* U = s.U_curr;
+    for (size_t i = 0; i < 3 * s.nn; i++) { if (!std::isfinite(U[i])) { return false; } }
+    for (size_t b = 0; b < s.nb; b++)
+    {
+        const EBlock& E = s.blocks[b];
+        for (int l = 0; l < W; l++)
+        {
+            const size_t e = b * W + (size_t)l;
+            if (e >= s.ne) { continue; }   // padding lane
+            const float u00 = U[E.n[0][l]], u01 = U[E.n[0][l] + 1], u02 = U[E.n[0][l] + 2];
+            const float u10 = U[E.n[1][l]], u11 = U[E.n[1][l] + 1], u12 = U[E.n[1][l] + 2];
+            const float u20 = U[E.n[2][l]], u21 = U[E.n[2][l] + 1], u22 = U[E.n[2][l] + 2];
+            const float u30 = U[E.n[3][l]], u31 = U[E.n[3][l] + 1], u32 = U[E.n[3][l] + 2];
+            const float a00 = E.J0[0][l] - u00 + u10, a01 = E.J0[1][l] - u01 + u11, a02 = E.J0[2][l] - u02 + u12;
+            const float a10 = E.J0[3][l] - u00 + u20, a11 = E.J0[4][l] - u01 + u21, a12 = E.J0[5][l] - u02 + u22;
+            const float a20 = E.J0[6][l] - u00 + u30, a21 = E.J0[7][l] - u01 + u31, a22 = E.J0[8][l] - u02 + u32;
+            const float i00 = a11 * a22 - a12 * a21, i01 = a02 * a21 - a01 * a22, i02 = a01 * a12 - a02 * a11;
+            const float det = a00 * i00 + a10 * i01 + a20 * i02;
+            if (!(det * E.invDetJ0[l] > 0.f)) { return false; }
+        }
+    }
+    return true;
+}
+
+static string waitPolicy()   // the OpenMP wait policy of this run (OMP_WAIT_POLICY, which main() sets if FAST_SPIN); "default" if none
+{
+    const char* value = getenv("OMP_WAIT_POLICY");
+    string policy = (value != nullptr && *value != '\0') ? value : "default";
+    transform(policy.begin(), policy.end(), policy.begin(), [](unsigned char c) { return (char)tolower(c); });
+    return policy;
+}
+
 static bool runSimulation(const Model& m, Solver& s, VtkExporter& exporter)
 {
     const int nthreads = omp_get_max_threads();
-    if (getenv("OMP_SCHEDULE") == nullptr) { omp_set_schedule(omp_sched_static, 0); }
+    int actual = 1;   // the team OpenMP actually creates (may be less than nthreads under OMP_THREAD_LIMIT)
+#pragma omp parallel num_threads(nthreads)
+    {
+#pragma omp single
+        actual = omp_get_num_threads();
+    }
     exporter.beginAnimation(m.num_steps, m.dt);   // does nothing unless the animation is switched on
+    if (!exporter.ok()) { cerr << "\n\tError: animation output could not be started." << endl; return false; }
     auto nfacOf = [&](size_t stp) { return min(1.f, (stp + 1) * m.dt / m.total_t); };   // BC:Disp ramp, never above the full displacement
-    cout << "\n\tusing " << nthreads << " threads" << endl;
+    cout << "\n\tusing " << actual << " threads (wait policy: " << waitPolicy() << ")" << endl;
     cout << "\tcomputing..." << endl;
     // Computation time = the solution only: the time loop's wall time, minus the time spent writing animation frames
     // (measured inside the exporter) and minus the time spent printing the progress lines (print_t, thread 0 only).
@@ -507,20 +588,49 @@ static bool runSimulation(const Model& m, Solver& s, VtkExporter& exporter)
     auto start_t = chrono::high_resolution_clock::now();
 
     float* Ubuf[3] = { s.U[0].data(), s.U[1].data(), s.U[2].data() };   // previous, current, next
-    int stop = 0;   // STOP_NAN / STOP_INVERTED
+    int stop[2] = { 0, 0 };   // STOP_NAN / STOP_INVERTED; even steps use stop[0], odd steps stop[1] (see the read below)
     long long fallbacks = 0;
     size_t steps_done = 0;
+#if FAST_PERSTEP
+    // ablation: one parallel region per step instead of one team for the whole time loop
+    {
+        float *Up = Ubuf[0], *Uc = Ubuf[1], *Un = Ubuf[2];
+        size_t progress = 0, stp = 0;
+        for (; stp < m.num_steps; stp++)
+        {
+            long long step_fallbacks = 0;
+#pragma omp parallel num_threads(nthreads) reduction(+:step_fallbacks)
+            {
+                step(s, nfacOf(stp), Uc, Up, Un, step_fallbacks, &stop[stp & 1]);
+            }
+            fallbacks += step_fallbacks;
+            float* t = Up; Up = Uc; Uc = Un; Un = t;
+            if (stop[stp & 1]) { break; }
+            if (exporter.isFrameStep(stp)) { exporter.writeFrame(stp, Uc); }
+            if ((float)(stp + 1) / (float)m.num_steps * 100.f >= progress + 10)
+            {
+                const auto print_start = chrono::high_resolution_clock::now();
+                progress += 10; cout << "\t\t\t(" << progress << "%)" << endl;
+                print_t += chrono::high_resolution_clock::now() - print_start;
+            }
+        }
+        s.U_curr = Uc; steps_done = stp + 1;
+    }
+#else
 #pragma omp parallel num_threads(nthreads) reduction(+:fallbacks)   // one thread team for the whole time loop
     {
         float *Up = Ubuf[0], *Uc = Ubuf[1], *Un = Ubuf[2];   // every thread rotates its own copy: no shared write
         size_t progress = 0, stp = 0;
         for (; stp < m.num_steps; stp++)
         {
-            step(s, nfacOf(stp), Uc, Up, Un, fallbacks, &stop);
+            step(s, nfacOf(stp), Uc, Up, Un, fallbacks, &stop[stp & 1]);
             float* t = Up; Up = Uc; Uc = Un; Un = t;
+            // Every thread must read the same value here: if only some left the loop, the others would wait at the next
+            // barrier for ever. A thread that is ahead may already be in step stp + 1 and set that step's flag, which is
+            // the other one; it cannot get to step stp + 2, and to this flag again, before every thread has passed here.
             int st;
 #pragma omp atomic read
-            st = stop;   // read after the step's final barrier: every thread sees the same value
+            st = stop[stp & 1];
             if (st) { break; }
             if (exporter.isFrameStep(stp))
             {
@@ -536,14 +646,24 @@ static bool runSimulation(const Model& m, Solver& s, VtkExporter& exporter)
         }
         if (omp_get_thread_num() == 0) { s.U_curr = Uc; steps_done = stp + 1; }
     }
+#endif
     const auto elapsed = chrono::high_resolution_clock::now() - start_t - exporter.animationTime() - print_t;   // solution only
     s.fallbacks = fallbacks;
-    exporter.endAnimation(!stop);
-    if (stop & STOP_INVERTED) { cerr << "\n\tError: an element inverted (its Jacobian determinant became zero or negative) at step " << steps_done << ", simulation aborted. Try a smaller time step." << endl; return false; }
-    if (stop) { cerr << "\n\tError: solution diverged at step " << steps_done << ", simulation aborted. Try a smaller time step." << endl; return false; }
+    const int stopped = stop[0] | stop[1];
+    if (!stopped && !finalStateValid(s))
+    {
+        cerr << "\n\tError: the final state contains a non-finite displacement or an inverted element; simulation aborted." << endl;
+        exporter.endAnimation(false);
+        return false;
+    }
+    exporter.endAnimation(!stopped);
+    if (stopped & STOP_INVERTED) { cerr << "\n\tError: an element inverted (its Jacobian determinant became zero or negative) at step " << steps_done << ", simulation aborted. Try a smaller time step." << endl; return false; }
+    if (stopped) { cerr << "\n\tError: solution diverged at step " << steps_done << ", simulation aborted. Try a smaller time step." << endl; return false; }
     cout << "\n\tComputation time:\t" << chrono::duration_cast<chrono::milliseconds>(elapsed).count() << " ms (solution only)" << endl;
-    if (exporter.animation()) { cout << "\tVTK export time:\t" << chrono::duration_cast<chrono::milliseconds>(exporter.animationTime()).count() << " ms (animation frames, not included above)" << endl; }
+    if (exporter.animation()) { cout << "\tAnimation export time:\t" << chrono::duration_cast<chrono::milliseconds>(exporter.animationTime()).count() << " ms (animation frames, not included above)" << endl; }
+#if !FAST_POWF   // with FAST_POWF every element update is exact, so there is no fall-back count to report
     cout << "\tJ^(-2/3) exact fall-backs:\t" << s.fallbacks << " of " << (long long)m.num_steps * (long long)s.ne << " element updates" << endl;
+#endif
     return true;
 }
 
@@ -569,7 +689,10 @@ static void printInfo(const Model& m, const bool reorder)
     cout << "\tTimeStep:\t"     << m.dt << endl;
     cout << "\tTotalTime:\t"    << m.total_t << endl;
     cout << "\tNumSteps:\t"     << m.num_steps << endl;
-    cout << "\tSpeed-ups:\t" << W << "-wide element blocks, J^(-2/3) warm start, persistent thread team, RCM reordering " << (reorder ? "on" : "off") << endl;
+    cout << "\tSpeed-ups:\t" << W << "-wide element blocks, "   // what this build and run really use (the ablation switches change it)
+         << (FAST_POWF ? "powf for J^(-2/3) (ablation)" : "J^(-2/3) warm start") << ", "
+         << (FAST_PERSTEP ? "a parallel region per step (ablation)" : "persistent thread team")
+         << ", RCM reordering " << (reorder ? "on" : "off") << endl;
     cout << "\n\tNode index starts at " << m.node_begin_index << "." << endl;
     cout << "  \tElem index starts at " << m.ele_begin_index  << "." << endl;
 }
@@ -590,22 +713,42 @@ int main(int argc, char **argv)
         if (sysctlbyname("hw.perflevel0.physicalcpu", &pcores, &len, nullptr, 0) == 0 && pcores > 0) { omp_set_num_threads(pcores); }
     }
 #endif
-    const char* fname = nullptr; bool reorder = true; int threads = 0;
+    const char* fname = nullptr; bool reorder = true; int threads = 0; long steps_cap = 0;
     VtkExportMode export_mode = VtkExportMode::Both;
-    const char* usage = "Usage: djtled_fast <input.txt> [--export both|animation|final|none] [--threads N] [--no-reorder]";
+    const char* usage = "Usage: djtled_fast <input.txt> [--export both|animation|final|none] [--threads N] [--steps N] [--no-reorder]";
     for (int i = 1; i < argc; i++)
     {
         if (strcmp(argv[i], "--export") == 0 && i + 1 < argc && parseVtkExportMode(argv[i + 1], export_mode)) { i++; }
-        else if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc && atoi(argv[i + 1]) > 0) { threads = atoi(argv[++i]); }
+        else if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc)
+        {
+            char* end = nullptr;
+            const long v = strtol(argv[i + 1], &end, 10);
+            if (end != argv[i + 1] && *end == '\0' && v > 0) { threads = (int)v; i++; }
+            else { cerr << "\n\tError: --threads needs a whole number of 1 or more. " << usage << endl; return EXIT_FAILURE; }
+        }
+        else if (strcmp(argv[i], "--steps") == 0 && i + 1 < argc)
+        {
+            char* end = nullptr;
+            const long v = strtol(argv[i + 1], &end, 10);
+            if (end != argv[i + 1] && *end == '\0' && v >= 1) { steps_cap = v; i++; }
+            else { cerr << "\n\tError: --steps needs a whole number of 1 or more. " << usage << endl; return EXIT_FAILURE; }
+        }
         else if (strcmp(argv[i], "--no-reorder") == 0) { reorder = false; }
         else if (strncmp(argv[i], "--", 2) == 0) { cerr << "\n\tError: unknown option or missing value: " << argv[i] << ". " << usage << endl; return EXIT_FAILURE; }
-        else { fname = argv[i]; }
+        else if (fname == nullptr) { fname = argv[i]; }
+        else { cerr << "\n\tError: more than one input file given (" << fname << " and " << argv[i] << "). " << usage << endl; return EXIT_FAILURE; }
     }
     if (fname == nullptr) { cerr << "\n\tError: missing input argument (e.g., NH.txt). " << usage << endl; return EXIT_FAILURE; }
     if (threads > 0) { omp_set_num_threads(threads); }   // --threads wins over the defaults above
     Model m;
     const auto read_start = chrono::high_resolution_clock::now();
     if (!readModel(fname, m)) { return EXIT_FAILURE; }
+    string out_name = SOLVER_NAME;
+    if (steps_cap > 0 && (size_t)steps_cap < m.num_steps)
+    {
+        m.num_steps = (size_t)steps_cap;   // partial run: same ramp, fewer steps
+        out_name += "_steps" + to_string((size_t)steps_cap);   // mark the output so it does not overwrite the full run
+    }
     auto preparation = chrono::high_resolution_clock::now() - read_start;   // reading the model and set-up; reported, not part of the computation time
     printInfo(m, reorder);
     Solver s;
@@ -613,9 +756,15 @@ int main(int argc, char **argv)
     if (!setup(m, s, reorder)) { return EXIT_FAILURE; }
     preparation += chrono::high_resolution_clock::now() - setup_start;
     cout << "\n\tPreparation time:\t" << chrono::duration_cast<chrono::milliseconds>(preparation).count() << " ms (reading the model and set-up; not part of the computation time)" << endl;
-    // VTK output (vtk_export.cpp): views of the mesh in the input numbering; newOfOld maps it to the solver numbering of U
-    static_assert(sizeof(array<unsigned, 4>) == 4 * sizeof(unsigned), "element nodes must be stored as a flat array");
-    VtkExporter exporter(SOLVER_NAME, m.fname, export_mode, VtkMesh{ m.nodes(), m.X.data(), m.tets.size(), m.tets[0].data(), s.newOfOld.data() });
+    // VTK output (vtk_export.cpp): a genuinely flat copy of the element nodes. m.tets is a vector<array>, whose storage
+    // is contiguous in practice but is not a single array object, so it cannot be indexed as one flat array by the exporter.
+    vector<unsigned int> vtk_tets;
+    if (export_mode != VtkExportMode::None)
+    {
+        vtk_tets.reserve(m.tets.size() * 4);
+        for (const auto& t : m.tets) { for (unsigned int n : t) { vtk_tets.push_back(n); } }
+    }
+    VtkExporter exporter(out_name, m.fname, export_mode, VtkMesh{ m.nodes(), m.X.data(), m.tets.size(), vtk_tets.data(), s.newOfOld.data() });
     if (!runSimulation(m, s, exporter)) { return EXIT_FAILURE; }
     exporter.writeFinalState(s.U_curr);
     return exporter.ok() ? EXIT_SUCCESS : EXIT_FAILURE;   // fails if the final state or an animation frame could not be written

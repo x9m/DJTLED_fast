@@ -22,10 +22,10 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
-// DJTLED.cpp: the original DJ-TLED code by Jinao Zhang, modified by Baiqi Cheng (builds on macOS); 
+// DJTLED.cpp: the original DJ-TLED code by Jinao Zhang, modified by Baiqi Cheng (builds on macOS;
 // VTK export moved to vtk_export.cpp; the timer covers the solution only).
-#define _CRT_SECURE_NO_WARNINGS // MSVC: allow the standard fopen/fscanf, which also build on macOS and Linux
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -40,8 +40,25 @@ using namespace  std;
 #ifndef SOLVER_NAME // the name in front of the output files; run.py sets it to this file's name when it compiles
 #define SOLVER_NAME "DJTLED"
 #endif
-static int NUM_THREADS(omp_get_max_threads());
-static chrono::high_resolution_clock::duration g_preparation(0); // reading the model and set-up; reported, not part of the computation time // OpenMP threads: all cores unless --threads (or OMP_NUM_THREADS) says otherwise
+static int NUM_THREADS(omp_get_max_threads());   // OpenMP threads: all cores unless --threads (or OMP_NUM_THREADS) says otherwise
+static int actualThreads(const int requested)
+{
+    int actual = 1;
+#pragma omp parallel num_threads(requested)
+    {
+#pragma omp single
+        actual = omp_get_num_threads();   // the team OpenMP actually created (may be less than requested)
+    }
+    return actual;
+}
+static string waitPolicy()   // the OpenMP wait policy this run was started with (OMP_WAIT_POLICY); "default" if none was set
+{
+    const char* value = getenv("OMP_WAIT_POLICY");
+    string policy = (value != nullptr && *value != '\0') ? value : "default";
+    transform(policy.begin(), policy.end(), policy.begin(), [](unsigned char c) { return (char)tolower(c); });
+    return policy;
+}
+static chrono::high_resolution_clock::duration g_preparation(0); // reading the model and set-up; reported, not part of the computation time
 
 // matrix computation/operations (mat: matrix, 33: 3 rows by 3 columns, x: multiplication, T: transpose, Det: determinant, Inv: inverse)
 void mat33x33    (const float A[3][3], const float B[3][3], float AB[3][3]);
@@ -59,7 +76,7 @@ class Model;
 class ModelStates;
 
 // methods
-Model*       readModel       (int argc, char **argv);
+Model*       readModel       (const char *fname);
 void         printInfo       (const Model& model);
 ModelStates* runSimulation   (const Model& model, VtkExporter& exporter);
 void         initBC          (const Model& model, ModelStates& modelstates);
@@ -209,16 +226,16 @@ class ModelStates
 {
 public:
     vector<float> m_external_F,          m_ele_nodal_internal_F,                       // individual ele nodal internal F to avoid race condition, can be summed to get internal_F for nodes
-                  m_disp_mag_t,
+                  m_disp_mag_t,          m_mass,
                   m_central_diff_const1, m_central_diff_const2, m_central_diff_const3,
                   m_prev_U,              m_curr_U,              m_next_U;
-    vector<bool>  m_fixP_flag;
+    vector<bool>  m_fixP_flag,           m_disp_flag;
     ModelStates(const Model& model) :
         m_external_F         (model.m_num_DOFs,   0.f), m_ele_nodal_internal_F(model.m_tets.size() * 4 * 3, 0.f), // each tet has 4 nodes, each node has 3 (x,y,z) DOFs
-        m_disp_mag_t         (model.m_num_DOFs,   0.f),
+        m_disp_mag_t         (model.m_num_DOFs,   0.f), m_mass                  (model.m_num_DOFs,            0.f),
         m_central_diff_const1(model.m_num_DOFs,   0.f), m_central_diff_const2 (model.m_num_DOFs,            0.f), m_central_diff_const3 (model.m_num_DOFs, 0.f),
         m_prev_U             (model.m_num_DOFs,   0.f), m_curr_U              (model.m_num_DOFs,            0.f), m_next_U              (model.m_num_DOFs, 0.f),
-        m_fixP_flag          (model.m_num_DOFs, false)
+        m_fixP_flag          (model.m_num_DOFs, false), m_disp_flag            (model.m_num_DOFs,            false)
     {
         vector<float> nodal_mass(model.m_num_DOFs, 0.f);
         for (T4* tet : model.m_tets) { for (size_t m = 0; m < 4; m++) { for (size_t n = 0; n < 3; n++) { nodal_mass[tet->m_n_idx[m] * 3 + n] += tet->m_mass / 4.f; } } }
@@ -228,32 +245,64 @@ public:
             m_central_diff_const2[i] = 2.f * nodal_mass[i] * m_central_diff_const1[i] / model.m_dt / model.m_dt;
             m_central_diff_const3[i] = model.m_alpha * nodal_mass[i] * m_central_diff_const1[i] / 2.f / model.m_dt - m_central_diff_const2[i] / 2.f;
         }
+        m_mass = nodal_mass;
     };
 };
 
-// Usage: djtled <input.txt> [--export both|animation|final|none] [--threads N]
+// Usage: djtled <input.txt> [--export both|animation|final|none] [--threads N] [--steps N]
 //        --export:  write the animation, the final state, both (default) or no VTK files
 //        --threads: number of OpenMP threads (default: all cores)
+//        --steps:   stop after N steps (a partial run; the loading ramp still spans the full total time)
 int main(int argc, char **argv)
 {
     VtkExportMode export_mode = VtkExportMode::Both;
-    for (int i = 2; i < argc; i++) // argv[1] is the model file
+    const char* fname = nullptr;
+    long steps_cap = 0;   // --steps N: stop after N steps, keeping the full ramp (a partial run)
+    const char* usage = "Usage: djtled <input.txt> [--export both|animation|final|none] [--threads N] [--steps N]";
+    for (int i = 1; i < argc; i++) // options may come before or after the model file
     {
         if (strcmp(argv[i], "--export") == 0 && i + 1 < argc && parseVtkExportMode(argv[i + 1], export_mode)) { i++; }
-        else if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc && atoi(argv[i + 1]) > 0) { NUM_THREADS = atoi(argv[++i]); omp_set_num_threads(NUM_THREADS); }
-        else { cerr << "\n\tError: unknown option or value: " << argv[i] << ". Usage: djtled <input.txt> [--export both|animation|final|none] [--threads N]" << endl; return EXIT_FAILURE; }
+        else if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc)
+        {
+            char* end = nullptr;
+            const long v = strtol(argv[i + 1], &end, 10);
+            if (end != argv[i + 1] && *end == '\0' && v > 0) { NUM_THREADS = (int)v; omp_set_num_threads(NUM_THREADS); i++; }
+            else { cerr << "\n\tError: --threads needs a whole number of 1 or more. " << usage << endl; return EXIT_FAILURE; }
+        }
+        else if (strcmp(argv[i], "--steps") == 0 && i + 1 < argc)
+        {
+            char* end = nullptr;
+            const long v = strtol(argv[i + 1], &end, 10);
+            if (end != argv[i + 1] && *end == '\0' && v >= 1) { steps_cap = v; i++; }
+            else { cerr << "\n\tError: --steps needs a whole number of 1 or more. " << usage << endl; return EXIT_FAILURE; }
+        }
+        else if (strncmp(argv[i], "--", 2) == 0) { cerr << "\n\tError: unknown option or missing value: " << argv[i] << ". " << usage << endl; return EXIT_FAILURE; }
+        else if (fname == nullptr) { fname = argv[i]; }
+        else { cerr << "\n\tError: more than one input file given. " << usage << endl; return EXIT_FAILURE; }
     }
+    if (fname == nullptr) { cerr << "\n\tError: missing input argument (e.g., NH.txt). " << usage << endl; return EXIT_FAILURE; }
     auto read_start = chrono::high_resolution_clock::now();
-    Model* model = readModel(argc, argv); // reads the file and precomputes the element data
+    Model* model = readModel(fname); // reads the file and precomputes the element data
     g_preparation += chrono::high_resolution_clock::now() - read_start;
     if (model != nullptr)
     {
+        string out_name = SOLVER_NAME;
+        if (steps_cap > 0 && (size_t)steps_cap < model->m_num_steps)
+        {
+            model->m_num_steps = (size_t)steps_cap;   // partial run: same ramp, fewer steps
+            out_name += "_steps" + to_string((size_t)steps_cap);   // mark the output so it does not overwrite the full run
+        }
         printInfo(*model);
-        // flat copies of the node coordinates and element nodes for the VTK exporter
+        // flat copies of the node coordinates and element nodes for the VTK exporter (skipped for timing-only runs)
         vector<float> vtk_coords; vector<unsigned int> vtk_tets;
-        for (Node* node : model->m_nodes) { vtk_coords.push_back(node->m_x); vtk_coords.push_back(node->m_y); vtk_coords.push_back(node->m_z); }
-        for (T4* tet : model->m_tets)     { for (size_t m = 0; m < 4; m++) { vtk_tets.push_back(tet->m_n_idx[m]); } }
-        VtkExporter exporter(SOLVER_NAME, model->m_fname, export_mode, VtkMesh{ model->m_nodes.size(), vtk_coords.data(), model->m_tets.size(), vtk_tets.data(), nullptr });
+        if (export_mode != VtkExportMode::None)
+        {
+            vtk_coords.reserve(model->m_nodes.size() * 3);
+            vtk_tets.reserve(model->m_tets.size() * 4);
+            for (Node* node : model->m_nodes) { vtk_coords.push_back(node->m_x); vtk_coords.push_back(node->m_y); vtk_coords.push_back(node->m_z); }
+            for (T4* tet : model->m_tets)     { for (size_t m = 0; m < 4; m++) { vtk_tets.push_back(tet->m_n_idx[m]); } }
+        }
+        VtkExporter exporter(out_name, model->m_fname, export_mode, VtkMesh{ model->m_nodes.size(), vtk_coords.data(), model->m_tets.size(), vtk_tets.data(), nullptr });
         ModelStates* modelstates = runSimulation(*model, exporter);
         if (modelstates != nullptr)
         {
@@ -263,73 +312,147 @@ int main(int argc, char **argv)
             delete modelstates;
             return saved ? EXIT_SUCCESS : EXIT_FAILURE;
         }
-        else { return EXIT_FAILURE; }
+        else { delete model; return EXIT_FAILURE; }
     }
     else { return EXIT_FAILURE; }
 }
 
 /*-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------*/
-Model* readModel(int argc, char **argv)
+Model* readModel(const char* fname)
 {
-    if (argc - 1 == 0) { cerr << "\n\tError: missing input argument (e.g., NH.txt)." << endl; return nullptr; }
-    FILE* file = fopen(argv[1], "r");
-    if (file == nullptr) { cerr << "\n\tError: cannot open file: " << argv[1] << endl; return nullptr; }
+    FILE* file = fopen(fname, "r");
+    if (file == nullptr) { cerr << "\n\tError: cannot open file: " << fname << endl; return nullptr; }
     else
     {
-        Model* model = new Model(argv[1]);
+        Model* model = new Model(fname);
         char buffer[256];
         unsigned int idx(0); float x(0.f), y(0.f), z(0.f);
-        fscanf(file, "%u %f %f %f", &idx, &x, &y, &z); model->m_node_begin_index = idx; model->m_nodes.push_back(new Node(idx - model->m_node_begin_index, x, y, z)); // for first node only, to get node begin index
-        while (fscanf(file, "%u %f %f %f", &idx, &x, &y, &z) == 4) { model->m_nodes.push_back(new Node(idx - model->m_node_begin_index, x, y, z)); } // internally, node index starts at 0
-        fscanf(file, "%255s", buffer); model->m_material_type = buffer;
-        if (model->m_material_type == "NH") { float Mu(0.f), K(0.f); fscanf(file, "%f %f", &Mu, &K); model->m_material_vals.push_back(Mu); model->m_material_vals.push_back(K); }
-        else if (model->m_material_type == "other_material_types") { /*add your code here*/ }
-        fscanf(file, "%255s %f", buffer, &model->m_rho);
-        fscanf(file, "%255s", buffer); model->m_ele_type = buffer;
+        if (fscanf(file, "%u %f %f %f", &idx, &x, &y, &z) != 4) { cerr << "\n\tError: no nodes found." << endl; delete model; fclose(file); return nullptr; }
+        model->m_node_begin_index = idx; model->m_nodes.push_back(new Node(0, x, y, z)); // internally, node index starts at 0
+        while (fscanf(file, "%u %f %f %f", &idx, &x, &y, &z) == 4)
+        {
+            if (idx - model->m_node_begin_index != model->m_nodes.size()) { cerr << "\n\tError: node indices must be consecutive." << endl; delete model; fclose(file); return nullptr; }
+            model->m_nodes.push_back(new Node(idx - model->m_node_begin_index, x, y, z));
+        }
+        if (fscanf(file, "%255s", buffer) != 1) { cerr << "\n\tError: missing material type." << endl; delete model; fclose(file); return nullptr; }
+        model->m_material_type = buffer;
+        if (model->m_material_type == "NH")
+        {
+            float Mu(0.f), K(0.f);
+            if (fscanf(file, "%f %f", &Mu, &K) != 2) { cerr << "\n\tError: NH material needs two values (Mu K)." << endl; delete model; fclose(file); return nullptr; }
+            if (!(Mu > 0.f) || !(K > 0.f)) { cerr << "\n\tError: NH material needs positive Mu and K." << endl; delete model; fclose(file); return nullptr; }
+            model->m_material_vals.push_back(Mu); model->m_material_vals.push_back(K);
+        }
+        else { cerr << "\n\tError: unsupported material type: " << model->m_material_type << endl; delete model; fclose(file); return nullptr; }
+        if (fscanf(file, "%255s %f", buffer, &model->m_rho) != 2 || string(buffer) != "Density") { cerr << "\n\tError: missing or misspelled Density line." << endl; delete model; fclose(file); return nullptr; }
+        if (!(model->m_rho > 0.f) || !std::isfinite(model->m_rho)) { cerr << "\n\tError: Density must be a positive finite number." << endl; delete model; fclose(file); return nullptr; }
+        if (fscanf(file, "%255s", buffer) != 1) { cerr << "\n\tError: missing element type." << endl; delete model; fclose(file); return nullptr; }
+        model->m_ele_type = buffer;
+        if (model->m_ele_type != "T4") { cerr << "\n\tError: unsupported element type: " << model->m_ele_type << " (only T4 is supported)." << endl; delete model; fclose(file); return nullptr; }
+        const size_t num_nodes = model->m_nodes.size();
+        auto validNode = [&](unsigned int n) { return n >= model->m_node_begin_index && n - model->m_node_begin_index < num_nodes; };
         unsigned int n1_idx(0), n2_idx(0), n3_idx(0), n4_idx(0);
-        fscanf(file, "%u %u %u %u %u", &idx, &n1_idx, &n2_idx, &n3_idx, &n4_idx); model->m_ele_begin_index = idx; model->m_tets.push_back(new T4(idx - model->m_ele_begin_index,
-                                                                                                                                                   *model->m_nodes[n1_idx - model->m_node_begin_index], *model->m_nodes[n2_idx - model->m_node_begin_index], *model->m_nodes[n3_idx - model->m_node_begin_index], *model->m_nodes[n4_idx - model->m_node_begin_index],
-                                                                                                                                                    model->m_rho, model->m_material_type, model->m_material_vals)); // for first ele only, to get ele begin index
-        while (fscanf(file, "%u %u %u %u %u", &idx, &n1_idx, &n2_idx, &n3_idx, &n4_idx) == 5) { model->m_tets.push_back(new T4(idx - model->m_ele_begin_index,
-                                                                                                                            *model->m_nodes[n1_idx - model->m_node_begin_index], *model->m_nodes[n2_idx - model->m_node_begin_index], *model->m_nodes[n3_idx - model->m_node_begin_index], *model->m_nodes[n4_idx - model->m_node_begin_index],
-                                                                                                                             model->m_rho, model->m_material_type, model->m_material_vals)); } // internally, ele index starts at 0
+        if (fscanf(file, "%u %u %u %u %u", &idx, &n1_idx, &n2_idx, &n3_idx, &n4_idx) != 5) { cerr << "\n\tError: no elements found." << endl; delete model; fclose(file); return nullptr; }
+        model->m_ele_begin_index = idx;
+        if (!validNode(n1_idx) || !validNode(n2_idx) || !validNode(n3_idx) || !validNode(n4_idx)) { cerr << "\n\tError: element refers to an unknown node." << endl; delete model; fclose(file); return nullptr; }
+        model->m_tets.push_back(new T4(0,
+            *model->m_nodes[n1_idx - model->m_node_begin_index], *model->m_nodes[n2_idx - model->m_node_begin_index], *model->m_nodes[n3_idx - model->m_node_begin_index], *model->m_nodes[n4_idx - model->m_node_begin_index],
+            model->m_rho, model->m_material_type, model->m_material_vals)); // for first ele only, to get ele begin index
+        while (fscanf(file, "%u %u %u %u %u", &idx, &n1_idx, &n2_idx, &n3_idx, &n4_idx) == 5)
+        {
+            if (idx - model->m_ele_begin_index != model->m_tets.size()) { cerr << "\n\tError: element indices must be consecutive." << endl; delete model; fclose(file); return nullptr; }
+            if (!validNode(n1_idx) || !validNode(n2_idx) || !validNode(n3_idx) || !validNode(n4_idx)) { cerr << "\n\tError: element refers to an unknown node." << endl; delete model; fclose(file); return nullptr; }
+            model->m_tets.push_back(new T4(idx - model->m_ele_begin_index,
+                *model->m_nodes[n1_idx - model->m_node_begin_index], *model->m_nodes[n2_idx - model->m_node_begin_index], *model->m_nodes[n3_idx - model->m_node_begin_index], *model->m_nodes[n4_idx - model->m_node_begin_index],
+                model->m_rho, model->m_material_type, model->m_material_vals));
+        }
+        auto readNodeList = [&](vector<unsigned int>& list) -> bool
+        {
+            const size_t before = list.size();
+            while (fscanf(file, "%u", &idx) == 1)
+            {
+                if (!validNode(idx)) { return false; }
+                list.push_back(idx - model->m_node_begin_index);
+            }
+            return list.size() > before;   // a BC must name at least one node
+        };
+        auto directionOf = [](const string& s) { return s == "x" ? 0 : s == "y" ? 1 : s == "z" ? 2 : -1; };
         while (fscanf(file, "%255s", buffer) == 1)
         {
             string BC_type(buffer), xyz("");
             if (BC_type == "<Disp>") // Displacements
             {
-                float u(0.f); fscanf(file, "%255s %f", buffer, &u); xyz = buffer;
-                if      (xyz == "x") { while (fscanf(file, "%u", &idx) == 1) { model->m_disp_idx_x.push_back(idx - model->m_node_begin_index); model->m_disp_mag_x.push_back(u); } }
-                else if (xyz == "y") { while (fscanf(file, "%u", &idx) == 1) { model->m_disp_idx_y.push_back(idx - model->m_node_begin_index); model->m_disp_mag_y.push_back(u); } }
-                else if (xyz == "z") { while (fscanf(file, "%u", &idx) == 1) { model->m_disp_idx_z.push_back(idx - model->m_node_begin_index); model->m_disp_mag_z.push_back(u); } }
+                float u(0.f);
+                if (fscanf(file, "%255s %f", buffer, &u) != 2) { cerr << "\n\tError: <Disp> needs a direction and a magnitude." << endl; delete model; fclose(file); return nullptr; }
+                xyz = buffer;
+                const int dir = directionOf(xyz);
+                if (dir < 0) { cerr << "\n\tError: unknown <Disp> direction '" << xyz << "' (use x, y or z)." << endl; delete model; fclose(file); return nullptr; }
+                if (!std::isfinite(u)) { cerr << "\n\tError: <Disp> magnitude must be finite." << endl; delete model; fclose(file); return nullptr; }
+                vector<unsigned int> list;
+                if (!readNodeList(list)) { cerr << "\n\tError: <Disp> must name at least one valid node." << endl; delete model; fclose(file); return nullptr; }
+                for (unsigned int n : list)
+                {
+                    if (dir == 0) { model->m_disp_idx_x.push_back(n); model->m_disp_mag_x.push_back(u); }
+                    else if (dir == 1) { model->m_disp_idx_y.push_back(n); model->m_disp_mag_y.push_back(u); }
+                    else { model->m_disp_idx_z.push_back(n); model->m_disp_mag_z.push_back(u); }
+                }
                 model->m_num_BCs++;
             }
             else if (BC_type == "<FixP>") // Fixed positions
             {
-                fscanf(file, "%255s", buffer); xyz = buffer;
-                if      (xyz == "x")   { while (fscanf(file, "%u", &idx) == 1) { model->m_fixP_idx_x.push_back(idx - model->m_node_begin_index); } }
-                else if (xyz == "y")   { while (fscanf(file, "%u", &idx) == 1) { model->m_fixP_idx_y.push_back(idx - model->m_node_begin_index); } }
-                else if (xyz == "z")   { while (fscanf(file, "%u", &idx) == 1) { model->m_fixP_idx_z.push_back(idx - model->m_node_begin_index); } }
-                else if (xyz == "all") { while (fscanf(file, "%u", &idx) == 1) { model->m_fixP_idx_x.push_back(idx - model->m_node_begin_index); model->m_fixP_idx_y.push_back(idx - model->m_node_begin_index); model->m_fixP_idx_z.push_back(idx - model->m_node_begin_index); } }
+                if (fscanf(file, "%255s", buffer) != 1) { cerr << "\n\tError: <FixP> needs a direction." << endl; delete model; fclose(file); return nullptr; }
+                xyz = buffer;
+                vector<unsigned int> list;
+                if (!readNodeList(list)) { cerr << "\n\tError: <FixP> must name at least one valid node." << endl; delete model; fclose(file); return nullptr; }
+                if (xyz == "x") { for (unsigned int n : list) { model->m_fixP_idx_x.push_back(n); } }
+                else if (xyz == "y") { for (unsigned int n : list) { model->m_fixP_idx_y.push_back(n); } }
+                else if (xyz == "z") { for (unsigned int n : list) { model->m_fixP_idx_z.push_back(n); } }
+                else if (xyz == "all") { for (unsigned int n : list) { model->m_fixP_idx_x.push_back(n); model->m_fixP_idx_y.push_back(n); model->m_fixP_idx_z.push_back(n); } }
+                else { cerr << "\n\tError: unknown <FixP> direction '" << xyz << "' (use x, y, z or all)." << endl; delete model; fclose(file); return nullptr; }
                 model->m_num_BCs++;
             }
             else if (BC_type == "<Gravity>") // Gravity
             {
-                float g(0.f); fscanf(file, "%255s %f", buffer, &g); xyz = buffer;
-                if      (xyz == "x") { model->m_grav_f_x.resize(model->m_nodes.size(), 0.f); for (T4* tet : model->m_tets) { for (size_t m = 0; m < 4; m++) { model->m_grav_f_x[tet->m_n_idx[m]] += tet->m_mass * g / 4.f; } } }
-                else if (xyz == "y") { model->m_grav_f_y.resize(model->m_nodes.size(), 0.f); for (T4* tet : model->m_tets) { for (size_t m = 0; m < 4; m++) { model->m_grav_f_y[tet->m_n_idx[m]] += tet->m_mass * g / 4.f; } } }
-                else if (xyz == "z") { model->m_grav_f_z.resize(model->m_nodes.size(), 0.f); for (T4* tet : model->m_tets) { for (size_t m = 0; m < 4; m++) { model->m_grav_f_z[tet->m_n_idx[m]] += tet->m_mass * g / 4.f; } } }
+                float g(0.f);
+                if (fscanf(file, "%255s %f", buffer, &g) != 2) { cerr << "\n\tError: <Gravity> needs a direction and a magnitude." << endl; delete model; fclose(file); return nullptr; }
+                xyz = buffer;
+                const int dir = directionOf(xyz);
+                if (dir < 0) { cerr << "\n\tError: unknown <Gravity> direction '" << xyz << "' (use x, y or z)." << endl; delete model; fclose(file); return nullptr; }
+                if (!std::isfinite(g)) { cerr << "\n\tError: <Gravity> magnitude must be finite." << endl; delete model; fclose(file); return nullptr; }
+                vector<float>& grav = (dir == 0) ? model->m_grav_f_x : (dir == 1) ? model->m_grav_f_y : model->m_grav_f_z;
+                grav.resize(model->m_nodes.size(), 0.f);
+                for (T4* tet : model->m_tets) { for (size_t m = 0; m < 4; m++) { grav[tet->m_n_idx[m]] += tet->m_mass * g / 4.f; } }
                 model->m_num_BCs++;
             }
-            else if (BC_type == "other_BC_types") { /*add your code here*/ }
             else if (BC_type == "</BC>") { break; }
+            else { cerr << "\n\tError: unknown boundary-condition tag '" << BC_type << "' (expected <Disp>, <FixP>, <Gravity> or </BC>)." << endl; delete model; fclose(file); return nullptr; }
         }
-        fscanf(file, "%255s %f", buffer, &model->m_alpha);
-        fscanf(file, "%255s %f", buffer, &model->m_dt);
-        fscanf(file, "%255s %f", buffer, &model->m_total_t);
+        if (fscanf(file, "%255s %f", buffer, &model->m_alpha) != 2 || string(buffer) != "Damping") { cerr << "\n\tError: missing or misspelled Damping line." << endl; delete model; fclose(file); return nullptr; }
+        if (fscanf(file, "%255s %f", buffer, &model->m_dt) != 2 || string(buffer) != "TimeStep") { cerr << "\n\tError: missing or misspelled TimeStep line." << endl; delete model; fclose(file); return nullptr; }
+        if (fscanf(file, "%255s %f", buffer, &model->m_total_t) != 2 || string(buffer) != "TotalTime") { cerr << "\n\tError: missing or misspelled TotalTime line." << endl; delete model; fclose(file); return nullptr; }
         fclose(file);
-        if (!(model->m_dt > 0.f) || !(model->m_total_t > 0.f)) { cerr << "\n\tError: TimeStep and TotalTime must be positive (is the input file complete?)." << endl; delete model; return nullptr; }
-        model->m_num_steps = (size_t)ceil(model->m_total_t / model->m_dt);
+        if (!(model->m_dt > 0.f) || !(model->m_total_t > 0.f) || !std::isfinite(model->m_dt) || !std::isfinite(model->m_total_t) || !std::isfinite(model->m_alpha) || !std::isfinite(model->m_total_t / model->m_dt))
+        { cerr << "\n\tError: Damping, TimeStep and TotalTime must be finite, and TimeStep and TotalTime positive (is the input file complete?)." << endl; delete model; return nullptr; }
+        // validate the input: finite values, positive initial volumes and no isolated nodes
+        {
+            bool invalid = false;
+            for (const Node* n : model->m_nodes) { if (!(std::isfinite(n->m_x) && std::isfinite(n->m_y) && std::isfinite(n->m_z))) { cerr << "\n\tError: node coordinates must be finite." << endl; invalid = true; break; } }
+            for (const float v : model->m_material_vals) { if (!std::isfinite(v)) { cerr << "\n\tError: material values must be finite." << endl; invalid = true; break; } }
+            if (invalid) { delete model; return nullptr; }
+            for (const T4* tet : model->m_tets) { if (!(tet->m_detJ0 > 0.f)) { cerr << "\n\tError: element " << tet->m_idx + model->m_ele_begin_index << " is inverted or flat (non-positive initial volume); check its node order." << endl; delete model; return nullptr; } }
+            vector<unsigned char> seen(model->m_nodes.size(), 0);
+            for (const T4* tet : model->m_tets) { for (size_t m = 0; m < 4; m++) { seen[tet->m_n_idx[m]] = 1; } }
+            for (size_t i = 0; i < seen.size(); i++) { if (!seen[i]) { cerr << "\n\tError: node " << i + model->m_node_begin_index << " is not part of any element (zero mass)." << endl; delete model; return nullptr; } }
+        }
+        {
+            // single-precision division can round a clean ratio (e.g. 0.05 / 0.000025) just above its integer, so
+            // ceil would add one extra step; snap ratios that are within float noise of an integer, then take ceil.
+            const double ratio = (double)model->m_total_t / (double)model->m_dt;
+            const double nearest = std::llround(ratio);
+            const double adjusted = (std::fabs(ratio - nearest) <= 1e-6 * std::max(1.0, std::fabs(ratio))) ? nearest : ratio;
+            model->m_num_steps = (size_t)std::ceil(adjusted);
+            if (model->m_num_steps == 0) { model->m_num_steps = 1; }
+        }
         model->m_num_DOFs = model->m_nodes.size() * 3;
         model->postCreate();
         return model;
@@ -370,10 +493,11 @@ ModelStates* runSimulation(const Model& model, VtkExporter& exporter)
     g_preparation += chrono::high_resolution_clock::now() - setup_start;
     cout << "\n\tPreparation time:\t" << chrono::duration_cast<chrono::milliseconds>(g_preparation).count() << " ms (reading the model and set-up; not part of the computation time)" << endl;
     size_t progress(0);
-    cout << "\n\tusing " << NUM_THREADS << " threads" << endl;
+    cout << "\n\tusing " << actualThreads(NUM_THREADS) << " threads (wait policy: " << waitPolicy() << ")" << endl;
     cout << "\tcomputing..." << endl;
     
     exporter.beginAnimation(model.m_num_steps, model.m_dt); // does nothing unless the animation is switched on
+    if (!exporter.ok()) { delete modelstates; return nullptr; }   // the animation was requested but could not be started
     
     // Computation time = the solution only: the time loop's wall time, minus the time spent writing animation frames
     // (measured inside the exporter) and minus the time spent printing the progress lines (print_t).
@@ -397,7 +521,7 @@ ModelStates* runSimulation(const Model& model, VtkExporter& exporter)
     
     long long t = chrono::duration_cast<chrono::milliseconds>(elapsed).count();
     cout << "\n\tComputation time:\t" << t << " ms (solution only)" << endl;
-    if (exporter.animation()) { cout << "\tVTK export time:\t" << chrono::duration_cast<chrono::milliseconds>(exporter.animationTime()).count() << " ms (animation frames, not included above)" << endl; }
+    if (exporter.animation()) { cout << "\tAnimation export time:\t" << chrono::duration_cast<chrono::milliseconds>(exporter.animationTime()).count() << " ms (animation frames, not included above)" << endl; }
     
     return modelstates;
 }
@@ -413,12 +537,21 @@ void initBC(const Model& model, ModelStates& modelstates)
     for (size_t i = 0; i < model.m_fixP_idx_x.size(); i++) { modelstates.m_fixP_flag[model.m_fixP_idx_x[i] * 3 + 0] = true; }
     for (size_t i = 0; i < model.m_fixP_idx_y.size(); i++) { modelstates.m_fixP_flag[model.m_fixP_idx_y[i] * 3 + 1] = true; }
     for (size_t i = 0; i < model.m_fixP_idx_z.size(); i++) { modelstates.m_fixP_flag[model.m_fixP_idx_z[i] * 3 + 2] = true; }
+    // BC:Disp (presence, independent of magnitude: a zero magnitude still constrains the DOF)
+    for (size_t i = 0; i < model.m_disp_idx_x.size(); i++) { modelstates.m_disp_flag[model.m_disp_idx_x[i] * 3 + 0] = true; }
+    for (size_t i = 0; i < model.m_disp_idx_y.size(); i++) { modelstates.m_disp_flag[model.m_disp_idx_y[i] * 3 + 1] = true; }
+    for (size_t i = 0; i < model.m_disp_idx_z.size(); i++) { modelstates.m_disp_flag[model.m_disp_idx_z[i] * 3 + 2] = true; }
+    // initialize the previous displacement so the first step starts from rest under the initial acceleration
+    for (size_t i = 0; i < model.m_num_DOFs; i++)
+    {
+        if (modelstates.m_mass[i] > 0.f) { modelstates.m_prev_U[i] = 0.5f * model.m_dt * model.m_dt * modelstates.m_external_F[i] / modelstates.m_mass[i]; }
+    }
 }
 
 void computeRunTimeBC(const Model& model, ModelStates& modelstates, const size_t curr_step)
 {
     // BC:Disp
-    const float n((curr_step + 1) * model.m_dt / model.m_total_t);
+    const float n(min(1.f, (curr_step + 1) * model.m_dt / model.m_total_t));   // ramp, never past the full displacement (same rule as DJTLED_fast)
     for (size_t i = 0; i < model.m_disp_idx_x.size(); i++) { modelstates.m_disp_mag_t[model.m_disp_idx_x[i] * 3 + 0] = model.m_disp_mag_x[i] * n; }
     for (size_t i = 0; i < model.m_disp_idx_y.size(); i++) { modelstates.m_disp_mag_t[model.m_disp_idx_y[i] * 3 + 1] = model.m_disp_mag_y[i] * n; }
     for (size_t i = 0; i < model.m_disp_idx_z.size(); i++) { modelstates.m_disp_mag_t[model.m_disp_idx_z[i] * 3 + 2] = model.m_disp_mag_z[i] * n; }
@@ -429,9 +562,10 @@ bool computeOneStep(const Model& model, ModelStates& modelstates)
     bool no_err(true);
 #pragma omp parallel num_threads(NUM_THREADS)
     {
-        int id = omp_get_thread_num();
+        const int nthreads = omp_get_num_threads();   // actual team size (may be less than NUM_THREADS)
+        const int id = omp_get_thread_num();
         float u[3][4], Jt[3][3], g[6], invJt[3][3], detJt(0.f), J(0.f), J23(0.f), I1(0.f), const1(0.f), f[3][4];
-        for (int i = id; i < model.m_tets.size(); i += NUM_THREADS) // loop through tets to compute for force contributions
+        for (size_t i = (size_t)id; i < model.m_tets.size(); i += (size_t)nthreads) // loop through tets to compute for force contributions
         {
             T4 *tet = model.m_tets[i];
             for (size_t m = 0; m < 4; m++) { for (size_t n = 0; n < 3; n++) { u[n][m] = modelstates.m_curr_U[tet->m_n_idx[m] * 3 + n]; } }
@@ -467,7 +601,7 @@ bool computeOneStep(const Model& model, ModelStates& modelstates)
             for (size_t m = 0; m < 4; m++) { for (size_t n = 0; n < 3; n++) { modelstates.m_ele_nodal_internal_F[tet->m_idx * 12 + m * 3 + n] = f[n][m]; } }
         }
 #pragma omp barrier
-        for (int i = id; i < model.m_nodes.size(); i += NUM_THREADS) // loop through nodes to compute for new displacements U
+        for (size_t i = (size_t)id; i < model.m_nodes.size(); i += (size_t)nthreads) // loop through nodes to compute for new displacements U
         {
             // assemble nodal forces from individual ele nodal forces, due to avoiding race condition
             float nodal_internal_F[3] = { 0.f, 0.f, 0.f };
@@ -486,7 +620,7 @@ bool computeOneStep(const Model& model, ModelStates& modelstates)
             for (size_t j = 0; j < 3; j++)
             {
                 n_DOF = i * 3 + j;
-                if (modelstates.m_disp_mag_t[n_DOF] != 0.f) { modelstates.m_next_U[n_DOF] = modelstates.m_disp_mag_t[n_DOF]; } // apply BC:Disp
+                if (modelstates.m_disp_flag[n_DOF]) { modelstates.m_next_U[n_DOF] = modelstates.m_disp_mag_t[n_DOF]; } // apply BC:Disp
                 else if (modelstates.m_fixP_flag[n_DOF] == true) { modelstates.m_next_U[n_DOF] = 0.f; }                        // apply BC:FixP
                 else                                                                                                           // explicit central-difference integration
                 {

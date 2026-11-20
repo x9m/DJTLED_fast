@@ -31,14 +31,14 @@
 
 \title{\textbf{A Faster DJ-TLED: Data-Layout and Arithmetic Optimisations of a Direct-Jacobian Explicit Finite Element Solver on CPU}}
 \author{Baiqi Cheng}
-\date{18 November 2026}
+\date{20 November 2026}
 
 \begin{document}
 \maketitle
 
 \begin{abstract}
 \noindent
-DJ-TLED is a total Lagrangian explicit dynamics finite element algorithm that computes nodal forces from the element Jacobian alone. This paper keeps the algorithm unchanged and asks how much faster its CPU implementation can be made. A second implementation, \DJF, stores each element in 88 bytes instead of 448, evaluates eight elements at a time with SIMD instructions, removes nine of ten divisions from the force expression, replaces the power function for $\Jm$ by a warm-started Newton iteration, keeps one thread team for the whole run, and renumbers the mesh for memory locality. Both implementations were measured on two neo-Hookean tension models of 6,713 and 361,175 tetrahedra, with 1 to 10 threads on a processor with 4 performance and 6 efficiency cores, under equal thread counts and wait policies. \DJF{} was 2.1 to 2.7 times faster on the small model and 2.5 to 7.1 times faster on the large one. The final displacements of the two implementations differ by 0.0016\,\% and 0.042\,\% of the prescribed displacement, which equals the distance of either from the reference results, and are identical for every thread count. A time-step sweep shows that single-precision rounding, not the time step, limits agreement on the large model to about 0.3\,\%.
+DJ-TLED is a total Lagrangian explicit dynamics finite element algorithm that computes nodal forces from the element Jacobian alone. This paper keeps the algorithm unchanged and asks how much faster its CPU implementation can be made. A second implementation, \DJF, stores each element in 88 bytes instead of 448, evaluates eight elements at a time with SIMD instructions, removes nine of ten divisions from the force expression, replaces the power function for $\Jm$ by a warm-started Newton iteration, keeps one thread team for the whole run, and renumbers the mesh for memory locality. Both implementations were measured on two neo-Hookean tension models of 6,713 and 361,175 tetrahedra, with 1 to 10 threads on a processor with 4 performance and 6 efficiency cores, under equal thread counts, quoting the faster of the reference's two wait-policy settings. \DJF{} was 2.1 to 2.7 times faster on the small model and 2.5 to 7.1 times faster on the large one. The final displacements of the two implementations differ by 0.0017\,\% and 0.042\,\% of the prescribed displacement, which equals the distance of either from the reference results, and are identical for every thread count. A time-step sweep shows that single-precision rounding, not the time step, limits agreement on the large model to about 0.3\,\%.
 \end{abstract}
 
 %======================================================================
@@ -90,7 +90,7 @@ Robustness & An inverted element is noticed only when it produces a not-a-number
 This paper presents \DJF, a second implementation of the same algorithm with the same input format, the same single-precision arithmetic and the same boundary-condition rules. It makes seven changes, each described with its mathematics and rationale in Section~\ref{sec:method}:
 \begin{enumerate}
 \item a compact element record stored in blocks of eight and evaluated with SIMD instructions;
-\item an algebraic simplification of the nodal force that removes one precomputed array and eight of the nine divisions;
+\item an algebraic simplification of the nodal force that removes one precomputed array and nine of the ten divisions;
 \item a warm-started Newton iteration for $\Jm$ in place of \code{powf};
 \item one thread team for the whole run, with spinning instead of sleeping between phases;
 \item one thread per performance core on processors with two kinds of core;
@@ -172,7 +172,7 @@ No two threads ever write the same memory, so no locks are needed. This two-pass
 
 \textbf{What the kernel needs.} Per element: four node indices, the nine entries of $\mat{J}_0$, the six distinct entries of a symmetric tensor $\mat{P}$ defined in Section~\ref{sec:algebra}, the reciprocal of $\det(\mat{J}_0)$, and the product $\kappa V_0$. That is 21 values, or 84 bytes.
 
-\textbf{Layout.} The reference stores an array of structures: one object per element, allocated separately. The fast solver stores an array of structures of arrays. A block holds each of the 21 fields as an array of eight values, one per element, so the same field of eight elements is contiguous and loads as one vector (Table~\ref{tab:layout}).
+\textbf{Layout.} The reference stores an array of structures: one object per element, allocated separately. The fast solver stores an array of structures of arrays. A block holds each of the 21 fields as an array of eight values, one per element, so the same field of eight elements is contiguous and vectorises (Table~\ref{tab:layout}).
 
 \begin{table}[ht]
 \centering
@@ -191,7 +191,7 @@ Evaluated & one element at a time & eight elements at a time \\
 \end{tabularx}
 \end{table}
 
-The sizes are those reported by the compiler for the two codes. The 448-byte object spans seven 64-byte cache lines. It includes six $3\times3$ matrices and other fields that are only needed during set-up.
+The sizes are those reported by the compiler for the two codes. The 448-byte object spans four 128-byte cache lines. It includes six $3\times3$ matrices and other fields that are only needed during set-up.
 
 \textbf{Kernel.} For one block the kernel first gathers the displacements of the $4\times8$ nodes into a local $12\times8$ array. It then runs the arithmetic of Section~\ref{sec:algebra} as a loop over the eight lanes, marked for vectorisation. It finally stores the $12\times8$ force components contiguously. The last block of a mesh is padded with inert elements, for which $\mat{J}_0$ is the identity and $\mat{P}$ and $\kappa V_0$ are zero. They produce $J = 1$ and zero force, so they need no special handling.
 
@@ -260,7 +260,7 @@ The relative error is squared and doubled at each iteration.
 
 \textbf{Mechanism.} The reference opens a parallel region in every step, which hands work to the threads and collects them again 40,000 times in the larger test. The fast solver opens one parallel region around the whole time loop. Every thread runs the loop itself and keeps its own copy of the three pointers to the previous, current and next displacement arrays, which it rotates after each step. The element pass and the node pass are work-sharing loops inside that region, and file output runs on a single thread. Waiting threads spin instead of sleeping. This active wait policy is a setting of the OpenMP runtime, not a property of the algorithm, and the reference can be given it as well; Section~\ref{sec:results} measures the reference both ways.
 
-\textbf{Contiguous shares.} The reference gives thread $k$ the elements $k$, $k+T$, $k+2T$ and so on. Every thread therefore walks the whole mesh, and neighbouring elements are handled by different threads. The 48-byte force record of an element then shares a 64-byte cache line with a record that another thread writes. The fast solver gives each thread one contiguous range of blocks and of nodes, so each thread works on its own region of memory.
+\textbf{Contiguous shares.} The reference gives thread $k$ the elements $k$, $k+T$, $k+2T$ and so on. Every thread therefore walks the whole mesh, and neighbouring elements are handled by different threads. The 48-byte force record of an element then shares a 128-byte cache line with a record that another thread writes. The fast solver gives each thread one contiguous range of blocks and of nodes, so each thread works on its own region of memory.
 
 \textbf{Rationale.} A step of the small model takes about 20 microseconds. Waking a sleeping thread takes a comparable time, so with sleeping threads the synchronisation costs as much as the computation. Spinning removes that delay. The cost is that a spinning thread occupies its core, which Section~\ref{sec:contrib} shows is harmful when the machine is busy with other work.
 
@@ -290,6 +290,12 @@ The relative error is squared and doubled at each iteration.
 \subsection{What is deliberately unchanged}
 \label{sec:unchanged}
 
+The reference implementation used here is Zhang's published code with small edits so that both solvers share the same
+input validation, boundary-condition rules, timing and output: the loading ramp is clamped at the full displacement, a
+prescribed degree of freedom is constrained even at zero magnitude, a run starts from rest under gravity, and the time
+loop is timed without file reading or set-up. The element force kernel is unchanged apart from its loop header (the
+stride now uses the actual team size), so the speed comparison is against the same arithmetic.
+
 \begin{itemize}
 \item \textbf{Single precision.} Both solvers compute and store displacements and forces as 32-bit floats.
 \item \textbf{The two-pass step and the fixed summation order.} Each node sums the forces of its elements in a fixed order, so the result does not depend on the number of threads or on how the loops are scheduled.
@@ -306,7 +312,7 @@ The two solvers can therefore differ only through rounding: the rearranged kerne
 
 Both solvers were run on the same two models, on one machine, under the same run conditions.
 
-\textbf{Models.} Both are a cube of side 0.1 with one face displaced by 0.05 in $y$, ramped linearly over a total time of 1, and the opposite face fixed. The material is neo-Hookean with $\mu = 6{,}567$, $\kappa = 326{,}210$, density 1,060 and damping coefficient $\alpha = 5$, in the units of the model files. A reference displacement field is distributed with each model and is used only in Section~\ref{sec:accuracy}. Table~\ref{tab:models} gives their sizes.
+\textbf{Models.} Both are a cube of side 0.1 with one face displaced by 0.05 in $y$, ramped linearly over a total time of 1, and the opposite face fixed; the displaced face is also fixed in $x$ and $z$. The material is neo-Hookean with $\mu = 6{,}567$, $\kappa = 326{,}210$, density 1,060 and damping coefficient $\alpha = 5$, in SI units (length in metres). The two models and their reference results were prepared for this study and are not part of Zhang's upstream repository; the build and step that generated each reference file are not recorded. A reference displacement field is distributed with each model and is used only in Section~\ref{sec:accuracy}. Table~\ref{tab:models} gives their sizes.
 
 \begin{table}[ht]
 \centering
@@ -335,7 +341,7 @@ Element evaluations in a run & $2.7\times10^{7}$ & $1.4\times10^{10}$ \\
 \item \textbf{Threads.} Both solvers are always compared at the same thread count: 1, 2, 4, 6 and 10. Four threads use the performance cores only; six and ten also use efficiency cores.
 \item \textbf{Wait policy.} \DJF{} asks the OpenMP runtime for active waiting (Section~\ref{sec:threads}). That is a runtime setting which the reference can also be given through an environment variable. The reference was therefore measured twice, as distributed and with active waiting, and every speed-up below is quoted against the faster of the two.
 \item \textbf{Repeats.} The small model was run in full five times per configuration. On the large model the first 2,001 steps were timed twice per configuration, since the work per step is constant in this problem; complete runs of 40,000 steps are reported as well. The tables give medians.
-\item \textbf{Machine state.} The machine was otherwise idle. Because it has no fan and slows down when warm, each run was followed by a pause of 2\,s on the small model and 10 to 15\,s on the large one.
+\item \textbf{Machine state.} The machine was otherwise idle. Because it has no fan and slows down when warm, each run was followed by a pause of 2\,s on the small model and 10 to 15\,s on the large one. The 2\,s pause lets the cores idle, and the first run after it pays a wake-up cost of about 8 to 25\,ms depending on the thread count; on the small model this fixed cost is part of every time below, so the small-model speed-ups are conservative (without the pause they would read about 2.4 to 3.1$\times$ instead of 2.1 to 2.7$\times$). The mechanism was not tested separately, and the pause has no measurable effect on the large model.
 \end{itemize}
 Repeated runs agreed to within 3\,\% of their median, with one exception: the 10-thread runs of the small model varied by up to a factor of two.
 
@@ -400,7 +406,7 @@ Both solvers are fastest with four threads, one per performance core, and both s
 
 The reference takes about the same time with one, four and ten threads, and is slower with two. \DJF{} needs 5.5\,s on one thread and 2.1\,s on four. The speed-up over the faster reference configuration is 2.5 on one thread and between 6.1 and 7.1 on two to ten threads.
 
-The single-thread figures isolate what the compact data layout and the cheaper arithmetic of Sections~\ref{sec:blocks} to~\ref{sec:newton} achieve without any parallelism: a factor of 2.1 on the small model and 2.5 on the large one. The rest of the gain on the large model comes from parallel scaling, which the reference does not have there. The likely cause is its strided distribution of elements (Section~\ref{sec:threads}): neighbouring 48-byte force records are written by different threads, so the threads continually invalidate each other's 64-byte cache lines. This explanation is consistent with the measurements but was not tested separately.
+The single-thread figures isolate what the compact data layout and the cheaper arithmetic of Sections~\ref{sec:blocks} to~\ref{sec:newton} achieve without any parallelism: a factor of 2.1 on the small model and 2.5 on the large one. The rest of the gain on the large model comes from parallel scaling, which the reference does not have there. The likely cause is its strided distribution of elements (Section~\ref{sec:threads}): neighbouring 48-byte force records are written by different threads, so the threads continually invalidate each other's 128-byte cache lines. This explanation is consistent with the measurements but was not tested separately.
 
 \DJF{} scales by a factor of 2.6 from one to four threads and gains nothing from the efficiency cores, which indicates that it is limited by memory bandwidth on this model.
 
@@ -409,7 +415,7 @@ The single-thread figures isolate what the compact data layout and the cheaper a
 \subsection{Contribution of each change}
 \label{sec:contrib}
 
-Spin waiting and SIMD evaluation matter most on the small model; renumbering and SIMD evaluation matter most on the large one. Table~\ref{tab:contrib} gives the time of \DJF{} at four threads with one change removed at a time, and how much slower that is than with all changes.
+The warm-started iteration for $\Jm$ matters most on both models. After it come spin waiting and SIMD evaluation on the small model, and SIMD evaluation and renumbering on the large one. Table~\ref{tab:contrib} gives the time of \DJF{} at four threads with one change removed at a time, and how much slower that is than with all changes.
 
 \begin{table}[ht]
 \centering
@@ -424,28 +430,32 @@ All changes ($W = 8$) & 78 & & 2.04 & \\
 Scalar kernel, $W = 1$ & 113 & 45\,\% & 2.76 & 35\,\% \\
 Block width $W = 4$ & 91 & 17\,\% & 2.19 & 7\,\% \\
 Block width $W = 16$ & 76 & $-3$\,\% & 2.06 & 1\,\% \\
-\code{powf} instead of the warm-started iteration & 102 & 31\,\% & 2.32 & 14\,\% \\
-No spin waiting & 140 & 79\,\% & 2.09 & 2\,\% \\
+\code{powf} instead of the warm-started iteration$^{\ast}$ & 141 & 86\,\% & 3.55 & 76\,\% \\
+No spin waiting (runtime default policy) & 140 & 79\,\% & 2.09 & 2\,\% \\
 A parallel region per step & 79 & 1\,\% & 2.20 & 8\,\% \\
 No renumbering & 95 & 22\,\% & 2.61 & 28\,\% \\
 \bottomrule
+\addlinespace
+\multicolumn{5}{@{}l@{}}{\footnotesize $^{\ast}$\,Measured in a later session; its percentages are against that session's all-changes times of 76\,ms and 2.01\,s.}
 \end{tabular}
 \end{table}
 
 Three points follow from Table~\ref{tab:contrib}.
 \begin{itemize}
-\item \textbf{The two models are limited by different things.} A step of the small model takes about 20 microseconds, so thread synchronisation and arithmetic dominate. A step of the large model takes about 1\,ms and moves far more data than fits in cache, so the order in which memory is visited dominates.
+\item \textbf{The two models are limited by different things.} A step of the small model takes about 20 microseconds, so thread synchronisation counts as much as arithmetic: spin waiting is worth 79\,\% there and 2\,\% on the large model. A step of the large model takes about 1\,ms and moves far more data than fits in cache, so synchronisation no longer matters and the order in which memory is visited matters more (28\,\% against 22\,\%). The arithmetic of the kernel matters on both.
 \item \textbf{A block width of eight is sufficient.} Widths of 8 and 16 are equal within the measurement spread, and a width of 4 is slower on both models.
 \item \textbf{The persistent thread team contributes little on this runtime.} Its effect is 1\,\% on the small model. The two large-model runs of that variant differed by 13\,\%, so its 8\,\% there is uncertain.
 \end{itemize}
-The compact element record of Section~\ref{sec:blocks} cannot be switched off separately, because the whole solver is built on it. Its contribution is contained in the single-thread speed-ups of Section~\ref{sec:speed}.
+The compact element record of Section~\ref{sec:blocks} cannot be switched off separately, because the whole solver is built on it. Its contribution is contained in the single-thread speed-ups of Section~\ref{sec:speed}. Table~\ref{tab:contrib} was measured in a separate session from Figure~\ref{fig:large}; its all-changes baseline of 2.04\,s differs from the 2.08\,s there by the machine's thermal drift.
+
+The \code{powf} row was measured in a later session with the \code{FAST\_POWF} compile switch now in the repository, under the protocol of Section~\ref{sec:setup}: four threads, five complete runs of the small model with a pause of 2\,s, and two runs of the first 2,001 steps of the large model with a pause of 12\,s. The build with all changes was timed in the same session, in alternation with the \code{powf} build. It gave 76\,ms and 2.01\,s, within 3\,\% of the first row of the table, and the \code{powf} build gave 141\,ms and 3.55\,s. The percentages of that row are against these same-session times. Because \code{powf} cannot be vectorised, the switch forces the eight-lane loop to process one element at a time, exactly as Section~\ref{sec:newton} describes. The row therefore contains the loss of SIMD evaluation as well as the cost of the call, and is larger than the scalar-kernel row above. Without the pause between runs the same two builds took 59\,ms and 122\,ms on the small model, which is 107\,\% slower: the wake-up cost of Section~\ref{sec:setup} is a fixed time added to both builds, so it lowers the percentage. Earlier figures of +31\,\% and +14\,\% for this row were measured with a variant that kept part of the vectorisation and do not reproduce.
 
 \textbf{A caution on spin waiting.} Spin waiting assumes that every thread has a core to itself. During this work the small model was once run with ten threads while another program occupied the machine. The run took between 5 and 11\,s instead of 0.09\,s. On a shared or busy machine the passive wait policy should be used.
 
 \subsection{Accuracy}
 \label{sec:accuracy}
 
-The two solvers agree to within 0.0016\,\% of the prescribed displacement on the small model and 0.042\,\% on the large one, and each is as close to the reference result as the other.
+The two solvers agree to within 0.0017\,\% of the prescribed displacement on the small model and 0.042\,\% on the large one, and each is as close to the reference result as the other.
 
 \textbf{Final displacement field.} Table~\ref{tab:accuracy} compares the nodal displacements at the end of the run. The difference at a node is the length of the difference vector. It is given in the length unit of the model and as a percentage of the prescribed displacement of 0.05.
 
@@ -458,20 +468,20 @@ The two solvers agree to within 0.0016\,\% of the prescribed displacement on the
 \toprule
 Model & Comparison & Largest difference & Largest, \% & RMSE & RMSE, \% \\
 \midrule
-Small & DJTLED vs reference & $7.41\times10^{-7}$ & 0.0015 & $2.07\times10^{-7}$ & 0.0004 \\
-Small & \DJF{} vs reference & $8.51\times10^{-7}$ & 0.0017 & $2.29\times10^{-7}$ & 0.0005 \\
-Small & \DJF{} vs DJTLED & $8.12\times10^{-7}$ & 0.0016 & $2.11\times10^{-7}$ & 0.0004 \\
+Small & DJTLED vs reference & $7.40\times10^{-7}$ & 0.0015 & $2.06\times10^{-7}$ & 0.0004 \\
+Small & \DJF{} vs reference & $8.87\times10^{-7}$ & 0.0018 & $2.28\times10^{-7}$ & 0.0005 \\
+Small & \DJF{} vs DJTLED & $8.37\times10^{-7}$ & 0.0017 & $2.09\times10^{-7}$ & 0.0004 \\
 \addlinespace
 Large & DJTLED vs reference & $2.54\times10^{-5}$ & 0.051 & $4.52\times10^{-6}$ & 0.0090 \\
-Large & \DJF{} vs reference & $2.15\times10^{-5}$ & 0.043 & $4.54\times10^{-6}$ & 0.0091 \\
+Large & \DJF{} vs reference & $2.15\times10^{-5}$ & 0.043 & $4.53\times10^{-6}$ & 0.0091 \\
 Large & \DJF{} vs DJTLED & $2.11\times10^{-5}$ & 0.042 & $4.01\times10^{-6}$ & 0.0080 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-On both models the difference between the two solvers is the same size as the distance of either solver from the reference. The changes of Section~\ref{sec:method} therefore add no error that can be distinguished from the rounding already present in the reference implementation. On the small model the differences are close to the six significant digits with which the displacements are written to file.
+On both models the difference between the two solvers is the same size as the distance of either solver from the reference. The changes of Section~\ref{sec:method} therefore add no error that can be distinguished from the rounding already present in the reference implementation. On the small model the differences are close to the six significant digits of the reference files; the solver output is written at full single-precision.
 
-\textbf{Independence of the CPU configuration.} For each solver, the output files of the small model are byte-for-byte identical with 1, 2, 4 and 10 threads. For \DJF{} they are also identical for SIMD widths of 1, 4, 8 and 16, with and without the persistent thread team, and with and without spin waiting. This follows from the fixed summation order of Section~\ref{sec:unchanged}. The accuracy figures above therefore hold for every CPU configuration in Section~\ref{sec:speed}.
+\textbf{Independence of the CPU configuration.} For each solver, the output files of the small model are byte-for-byte identical with 1, 2, 4 and 10 threads. For \DJF{} they are also identical for SIMD widths of 1, 4, 8 and 16, with and without the persistent thread team, and with and without spin waiting. This follows from the fixed summation order of Section~\ref{sec:unchanged}. The accuracy figures above therefore hold for the CPU configurations tested here.
 
 \textbf{Warm start.} The Newton iteration of Section~\ref{sec:newton} never needed its \code{powf} fallback: zero fallbacks in $2.7\times10^{7}$ element evaluations on the small model and in $1.4\times10^{10}$ on the large one.
 
@@ -501,7 +511,7 @@ On both models the difference between the two solvers is the same size as the di
 \node[anchor=south, font=\scriptsize, align=center] at (axis cs:4.5,0.03) {run failed:\\element inverted};
 \end{axis}
 \end{tikzpicture}
-\caption{Large model: largest nodal difference from the reference result, as a percentage of the prescribed displacement, for 16 complete runs of \DJF{} at 4 threads with different time steps. The difference does not decrease as the step is reduced.}
+\caption{Large model: largest nodal difference from the reference result, as a percentage of the prescribed displacement, for 15 complete runs of \DJF{} at 4 threads with different time steps, and one run that failed when an element inverted. The difference does not decrease as the step is reduced.}
 \label{fig:sweep}
 \end{figure}
 
@@ -515,9 +525,9 @@ The difference from the reference varies between 0.025\,\% and 0.30\,\% and does
 
 \DJF{} computes the same DJ-TLED solution as the reference implementation 2.1 to 2.7 times faster on a 6,713-element model and up to 7 times faster on a 361,175-element model, with no loss of accuracy that can be measured against the reference.
 
-\textbf{Where the gain comes from.} The compact element record, the simplified force expression and the warm-started iteration for $\Jm$ make one thread 2.1 to 2.5 times faster. On the large model the remaining factor comes from parallel scaling: \DJF{} is 2.6 times faster on four threads than on one, whereas the reference is no faster on four or ten threads than on one. Among the individual changes, spin waiting and SIMD evaluation matter most for the small model, and renumbering and SIMD evaluation for the large one.
+\textbf{Where the gain comes from.} The compact element record, the simplified force expression and the warm-started iteration for $\Jm$ make one thread 2.1 to 2.5 times faster. On the large model the remaining factor comes from parallel scaling: \DJF{} is 2.6 times faster on four threads than on one, whereas the reference is no faster on four or ten threads than on one. Among the individual changes, the warm-started iteration for $\Jm$ matters most on both models, followed by spin waiting and SIMD evaluation on the small model and by SIMD evaluation and renumbering on the large one.
 
-\textbf{Accuracy.} The two solvers differ by 0.0016\,\% of the prescribed displacement on the small model and 0.042\,\% on the large one. In both cases this equals the distance of either solver from the reference result. The results of each solver are identical for every thread count.
+\textbf{Accuracy.} The two solvers differ by 0.0017\,\% of the prescribed displacement on the small model and 0.042\,\% on the large one. In both cases this equals the distance of either solver from the reference result. The results of each solver are identical for every thread count.
 
 \textbf{Three findings beyond the speed-up.}
 \begin{itemize}
