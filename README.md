@@ -263,3 +263,7 @@ reported, `Preparation time: N ms` and, after the thread count, `(wait policy: N
 
 MIT; see [LICENSE](LICENSE). The original DJ-TLED code is copyright (c) 2022 Jinao Zhang. The modifications and
 `DJTLED_fast` are copyright (c) 2026 Baiqi Cheng.
+
+## Acknowledgements
+
+This project was developed with the assistance of the AI models Claude Fable 5.2 and DeepSeek V4-Pro.
