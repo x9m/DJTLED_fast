@@ -193,7 +193,18 @@ Evaluated & one element at a time & eight elements at a time \\
 
 The sizes are those reported by the compiler for the two codes. The 448-byte object spans four 128-byte cache lines. It includes six $3\times3$ matrices and other fields that are only needed during set-up.
 
-\textbf{Kernel.} For one block the kernel first gathers the displacements of the $4\times8$ nodes into a local $12\times8$ array. It then runs the arithmetic of Section~\ref{sec:algebra} as a loop over the eight lanes, marked for vectorisation. It finally stores the $12\times8$ force components contiguously. The last block of a mesh is padded with inert elements, for which $\mat{J}_0$ is the identity and $\mat{P}$ and $\kappa V_0$ are zero. They produce $J = 1$ and zero force, so they need no special handling.
+\textbf{Evaluating one block, step by step.} SIMD (single instruction, multiple data) evaluation means that one processor instruction carries out the same operation on several values at once. The kernel is called once per block in every time step and proceeds as follows. A lane is one of the eight elements of the block.
+\begin{enumerate}
+\item \textbf{Gather.} For each of the 4 nodes of each of the 8 elements, the kernel reads the three displacement components of that node, using the node indices stored in the block. The result is a local array of $12\times8$ values: 12 displacement components, each for eight elements.
+\item \textbf{Compute.} It runs the arithmetic of Section~\ref{sec:algebra} as one loop over the eight lanes. The loop body is the same sequence of operations for every lane: $\mat{J}_t$, the six components of $\mat{g}$, the adjugate and the determinant of $\mat{J}_t$, the volume ratio $J$, the value of $\Jm$, the scalar $s$ and the nine force components.
+\item \textbf{Vectorise.} Every operand in that loop is an array of eight values of the same field. The compiler therefore replaces each scalar operation by vector instructions that process several lanes at once. On the test machine one instruction handles four single-precision values, so an operation on eight lanes takes two instructions instead of eight.
+\item \textbf{Check.} Each lane also sets a flag if its starting value for $\Jm$ was rejected or its element is inverted (Sections~\ref{sec:newton} and~\ref{sec:inverted}). The flags of the eight lanes are combined into one. Only if it is set are the flagged lanes recomputed, one at a time.
+\item \textbf{Store.} The $12\times8$ force components are written, contiguously, into the slot of the force buffer that belongs to this block.
+\end{enumerate}
+
+\textbf{What vectorisation requires.} The compiler can carry out step 3 only if the loop body contains no function call, no branch that depends on the data, and no dependence of one lane on another. These conditions shape the rest of the solver: \code{powf} is replaced by an iteration (Section~\ref{sec:newton}), the test for an inverted element sets a flag instead of branching, and the rare exact recomputation of step 4 is kept outside the loop.
+
+\textbf{Padding.} The last block of a mesh is padded with inert elements, for which $\mat{J}_0$ is the identity and $\mat{P}$ and $\kappa V_0$ are zero. They produce $J = 1$ and zero force, so they need no special handling.
 
 \textbf{Rationale.} An explicit solver has two regimes. A small mesh fits in cache and is limited by arithmetic, where SIMD helps directly. A large mesh is limited by the rate at which element data can be read from memory, where the fivefold smaller record helps. The block layout addresses both with one data structure. The width $W$ is a compile-time constant; Section~\ref{sec:contrib} reports widths 1, 4, 8 and 16.
 
@@ -251,6 +262,26 @@ The relative error is squared and doubled at each iteration.
 
 \textbf{Fallback.} If the test fails for an element, that element alone is recomputed with \code{powf}. In every run reported in this paper the number of fallbacks was zero.
 
+\textbf{The procedure for one element in one step.}
+\begin{enumerate}
+\item Compute $J = \det\mat{J}_t \cdot (1/\det\mat{J}_0)$ from the current displacements.
+\item Load $y$, the value of $\Jm$ that this element had in the previous step. Before the first step it is 1, which is exact for an undeformed element.
+\item Compute the residual $r = J^2 y^3$. It equals 1 exactly when $y = \Jm$.
+\item Test the starting value: if $|r - 1| \ge 10^{-2}$, or if $J \le 0$, flag the element.
+\item Iterate twice: $y \leftarrow \tfrac{1}{3}\,y\,(4 - r)$, then $r \leftarrow J^2 y^3$.
+\item Store $y$ for the next step, and use it as $\Jm$ in the force of Eq.~\eqref{eq:fastforce}.
+\item If the element was flagged in step 4, discard its result and recompute it with $\Jm$ from \code{powf}. If $J \le 0$, the run stops (Section~\ref{sec:inverted}).
+\end{enumerate}
+Steps 1 to 6 contain no branch and no function call. The flag of step 4 is only recorded, and the iteration of step 5 is carried out for a flagged element as well, so that all eight lanes of a block perform the same operations (Section~\ref{sec:blocks}). Step 7 is done afterwards, outside the vectorised loop.
+
+\textbf{Worked example.} Take an element that was undeformed in the previous step, so $y = 1$, and now has $J = 1.001$. The exact value is $\Jm = 0.99933389$.
+\begin{enumerate}
+\item The residual is $r = 1.001^2 \cdot 1^3 = 1.002001$. Since $|r - 1| = 0.002 < 10^{-2}$, the starting value is accepted. Its relative error is $6.7\times10^{-4}$.
+\item First iteration: $y = \tfrac{1}{3}(4 - 1.002001) = 0.99933300$. The relative error is now $8.9\times10^{-7}$, which is $2e^2$ for $e = 6.7\times10^{-4}$.
+\item Second iteration: $y = 0.99933389$. The relative error is $1.6\times10^{-12}$, far below the single-precision rounding unit of $6\times10^{-8}$.
+\end{enumerate}
+In the runs of this paper the starting value was accepted for every element in every step (Section~\ref{sec:accuracy}), so the procedure never reached step 7.
+
 \textbf{Rationale.} \code{powf} is a library call that the compiler cannot vectorise, so it would force the eight-lane loop of Section~\ref{sec:blocks} to process one element at a time. The iteration is five multiplications and one subtraction per pass and vectorises fully.
 
 \subsection{One thread team and spin waiting}
@@ -260,9 +291,20 @@ The relative error is squared and doubled at each iteration.
 
 \textbf{Mechanism.} The reference opens a parallel region in every step, which hands work to the threads and collects them again 40,000 times in the larger test. The fast solver opens one parallel region around the whole time loop. Every thread runs the loop itself and keeps its own copy of the three pointers to the previous, current and next displacement arrays, which it rotates after each step. The element pass and the node pass are work-sharing loops inside that region, and file output runs on a single thread. Waiting threads spin instead of sleeping. This active wait policy is a setting of the OpenMP runtime, not a property of the algorithm, and the reference can be given it as well; Section~\ref{sec:results} measures the reference both ways.
 
+\textbf{One time step, as each thread executes it.}
+\begin{enumerate}
+\item \textbf{Element pass.} The thread computes the forces of its own range of element blocks. It reads displacements of any node, and writes only the force slots of its own blocks.
+\item \textbf{First meeting point.} It waits until every thread has finished the element pass. The node pass cannot start earlier, because a node sums forces of elements that belong to other threads.
+\item \textbf{Node pass.} The thread updates its own range of nodes. It reads forces of any element, and writes only the new displacements of its own nodes.
+\item \textbf{Second meeting point.} It waits until every thread has finished the node pass, because the next element pass reads displacements of nodes that belong to other threads.
+\item \textbf{Bookkeeping.} The thread rotates its three pointers. It then reads a flag that any thread sets when an element inverts or a displacement is not a number; if the flag is set, all threads leave the loop together. On a step for which output is written, one thread writes it while the others wait.
+\end{enumerate}
+
+\textbf{What a waiting thread does.} At each meeting point every thread except the last to arrive has to wait, so a thread waits up to twice per step. The OpenMP runtime offers two ways of waiting. With the passive policy the waiting thread may give up its core and sleep, and it has to be woken when the last thread arrives. With the active policy it stays on its core and keeps checking whether the others have arrived, so it continues at once. \DJF{} asks for the active policy when it starts, unless the user has chosen a policy.
+
 \textbf{Contiguous shares.} The reference gives thread $k$ the elements $k$, $k+T$, $k+2T$ and so on. Every thread therefore walks the whole mesh, and neighbouring elements are handled by different threads. The 48-byte force record of an element then shares a 128-byte cache line with a record that another thread writes. The fast solver gives each thread one contiguous range of blocks and of nodes, so each thread works on its own region of memory.
 
-\textbf{Rationale.} A step of the small model takes about 20 microseconds. Waking a sleeping thread takes a comparable time, so with sleeping threads the synchronisation costs as much as the computation. Spinning removes that delay. The cost is that a spinning thread occupies its core, which Section~\ref{sec:contrib} shows is harmful when the machine is busy with other work.
+\textbf{Rationale.} A step of the small model takes about 20 microseconds. Waking a sleeping thread takes a comparable time, so with sleeping threads the synchronisation costs as much as the computation. Spinning removes that delay. The cost is that a spinning thread occupies its core, which Section~\ref{sec:contrib} shows is harmful when the machine is busy with other work. The delay is paid at the meeting points of every step and does not depend on the size of the mesh. Its share of the run time therefore depends on the length of a step: it is large for the small model and small for the large model, where a step takes about 1\,ms.
 
 \subsection{One thread per performance core}
 \label{sec:pcores}
@@ -276,7 +318,18 @@ The relative error is squared and doubled at each iteration.
 
 \textbf{Change.} Before the time loop, nodes are renumbered by the reverse Cuthill--McKee algorithm \cite{cuthill1969} and elements are sorted by their lowest and highest node number. Results are written in the original numbering.
 
-\textbf{Mechanism.} Two nodes are adjacent if they share an element. Reverse Cuthill--McKee orders the nodes by a breadth-first traversal from a peripheral node, which keeps adjacent nodes close in number. The four nodes of an element then lie close together in the displacement array, and the elements around a node lie close together in the force buffer.
+\textbf{The procedure, step by step.}
+\begin{enumerate}
+\item \textbf{Build the node graph.} Two nodes are adjacent if they share an element. For every node the list of its neighbours is collected. The degree of a node is the number of its neighbours.
+\item \textbf{Choose a start node at the edge of the mesh.} A breadth-first search from any node that is not yet numbered sorts the nodes into levels by their distance from it. A node of lowest degree in the last level is taken, and the search is repeated once from that node. A node of lowest degree in the last level of this second search is the start node. Starting far from the middle of the mesh keeps the levels of the next step narrow.
+\item \textbf{Number the nodes level by level.} From the start node, the nodes are visited in breadth-first order. When a node is visited, its neighbours that are not yet numbered are appended to the order, those of lowest degree first. This is the Cuthill--McKee order.
+\item \textbf{Reverse the order.} The last node becomes the first. This is the reverse Cuthill--McKee order.
+\item \textbf{Repeat for separate parts.} If the mesh consists of parts that are not connected to each other, steps 2 to 4 are repeated for each part.
+\item \textbf{Order the elements.} The elements are sorted by their lowest new node number and, where that is equal, by their highest. They fill the blocks of eight of Section~\ref{sec:blocks} in this order.
+\item \textbf{Keep the map.} The solver works in the new numbering throughout. The map between old and new node numbers is kept, and results are written in the original numbering.
+\end{enumerate}
+
+\textbf{Effect.} A breadth-first search places adjacent nodes in the same level or in neighbouring levels, so their numbers are close. The four nodes of an element then lie close together in the displacement array, and the elements around a node lie close together in the force buffer.
 
 \textbf{Rationale.} Both passes gather data by index: the element pass gathers displacements and the node pass gathers forces. If the indices of neighbours are far apart, every gather is a cache miss. The benefit depends on how the mesh generator numbered the input, so it varies from model to model. The renumbering is done once, before the timed loop; it added about 1\,ms to the preparation of the small model and about 65\,ms to that of the large one.
 
@@ -415,7 +468,7 @@ The single-thread figures isolate what the compact data layout and the cheaper a
 \subsection{Contribution of each change}
 \label{sec:contrib}
 
-The warm-started iteration for $\Jm$ matters most on both models. After it come spin waiting and SIMD evaluation on the small model, and SIMD evaluation and renumbering on the large one. Table~\ref{tab:contrib} gives the time of \DJF{} at four threads with one change removed at a time, and how much slower that is than with all changes.
+The warm-started iteration for $\Jm$ (Section~\ref{sec:newton}) matters most on both models. After it come spin waiting (Section~\ref{sec:threads}) and SIMD evaluation (Section~\ref{sec:blocks}) on the small model, and SIMD evaluation and renumbering (Section~\ref{sec:renumber}) on the large one. Table~\ref{tab:contrib} gives the time of \DJF{} at four threads with one change removed at a time, and how much slower that is than with all changes.
 
 \begin{table}[ht]
 \centering

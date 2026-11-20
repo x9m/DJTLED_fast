@@ -152,7 +152,7 @@ _point_counts = {}   # (file, time of its last change) -> number of points
 
 def point_count(vtk_file):
     """Number of points in a legacy VTK file (from its POINTS line, without reading the whole file); None if not found."""
-    key = (str(vtk_file), vtk_file.stat().st_mtime)
+    key = (str(vtk_file), vtk_file.stat().st_mtime_ns)
     if key not in _point_counts:
         count = None
         with open(vtk_file, errors="replace") as f:
