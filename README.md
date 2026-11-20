@@ -248,6 +248,7 @@ discover.py  finds models, solvers, results and references by looking in the fol
 build/       compiled solvers (created by run.py, not in git)
 results/     solver output, comparison files, timings (not in git)
 A Faster DJ-TLED (paper).pdf / .tex   the paper comparing the two solvers, and its LaTeX source
+DJTLED Python/   DJTLED.ipynb, a NumPy port of DJTLED.cpp as an explained notebook (needs numpy; see its requirements.txt)
 ```
 
 Nothing in the scripts is tied to particular file names. Any `.txt` file in `models/` is a model, any `.cpp` file in
