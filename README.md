@@ -9,6 +9,8 @@ DJ-TLED is the algorithm described in:
 > simulation of hyperelastic materials. *International Journal for Numerical Methods in Engineering*, 122(20),
 > 5744–5772. doi:10.1002/nme.6772
 
+The original DJ-TLED source code is at [github.com/jinaojakezhang/DJTLED](https://github.com/jinaojakezhang/DJTLED).
+
 Both solvers here use 4-node tetrahedral elements, a neo-Hookean material and explicit central-difference time
 integration, in single precision, parallelised with OpenMP.
 
